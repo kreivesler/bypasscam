@@ -1,0 +1,15 @@
+[package]
+name = "bypass-audio-rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "bypass_audio_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+jni = { version = "0.21" }
+libc = "0.2"
+ringbuf = "0.4"
+log = "0.4"
+android_logger = "0.14"

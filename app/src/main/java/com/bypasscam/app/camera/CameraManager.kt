@@ -12,6 +12,9 @@ import androidx.camera.video.*
 import androidx.camera.video.VideoCapture
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import com.bypasscam.app.usb.AudioEncoder
+import com.bypasscam.app.usb.MuxerHelper
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ExecutorService
@@ -31,6 +34,14 @@ class CameraManager(private val context: Context) {
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     var isFrontCamera = false
+
+    // USB Bypass variables
+    private var isUsingUsbMicDuringRecording = false
+    private val audioEncoder = AudioEncoder()
+    private var tempVideoFile: File? = null
+    private var tempAudioFile: File? = null
+    private var tempMuxedFile: File? = null
+    private var pendingContentValues: ContentValues? = null
 
     fun startCamera(
         lifecycleOwner: LifecycleOwner,
@@ -56,12 +67,12 @@ class CameraManager(private val context: Context) {
             // VideoCapture configuration - Optimized for Moto g04
             // Using HD quality to provide a stable frame rate without overwhelming the hardware.
             val qualitySelector = QualitySelector.from(
-                Quality.HD,
+                Quality.SD,
                 FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
             )
 
             val recorder = Recorder.Builder()
-                .setExecutor(cameraExecutor)
+                .setExecutor(ContextCompat.getMainExecutor(context))
                 .setQualitySelector(qualitySelector)
                 .build()
 
@@ -79,7 +90,6 @@ class CameraManager(private val context: Context) {
                     lifecycleOwner,
                     cameraSelector,
                     preview,
-                    imageCapture,
                     videoCapture
                 )
             } catch (exc: Exception) {
@@ -123,13 +133,19 @@ class CameraManager(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     fun toggleRecording(isUsbMicConnected: Boolean, onRecordingStateChanged: (Boolean) -> Unit) {
-        val videoCapture = this.videoCapture ?: return
+        val videoCapture = this.videoCapture ?: run {
+            Log.e(TAG, "videoCapture está nulo!")
+            return
+        }
 
         val curRecording = recording
         if (curRecording != null) {
-            // Stop current recording
+            Log.d(TAG, "Parando gravação ativa...")
             curRecording.stop()
             recording = null
+            if (isUsingUsbMicDuringRecording) {
+                audioEncoder.stop()
+            }
             onRecordingStateChanged(false)
             return
         }
@@ -143,37 +159,115 @@ class CameraManager(private val context: Context) {
             put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/BypassCam")
         }
 
-        val mediaStoreOutputOptions = MediaStoreOutputOptions
-            .Builder(context.contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-            .setContentValues(contentValues)
-            .build()
+        isUsingUsbMicDuringRecording = isUsbMicConnected
+        pendingContentValues = contentValues
 
-        val pendingRecording = videoCapture.output
-            .prepareRecording(context, mediaStoreOutputOptions)
+        val pendingRecording = if (isUsbMicConnected) {
+            Log.d(TAG, "Iniciando gravação com bypass de driver USB genérico...")
+            
+            // Set up temp cache files
+            val videoFile = File(context.cacheDir, "temp_video.mp4")
+            if (videoFile.exists()) videoFile.delete()
+            tempVideoFile = videoFile
 
-        // Structure for Audio setup: 
-        // When working with generic devices like Moto g04, default audio routing works best.
-        // If a USB device is detected and permissions granted, Android automatically
-        // redirects audio from the USB interface to the system's microphone input.
-        // We use standard withAudioEnabled() which reads from default microphone source.
-        pendingRecording.withAudioEnabled()
+            val audioFile = File(context.cacheDir, "temp_audio.mp4")
+            if (audioFile.exists()) audioFile.delete()
+            tempAudioFile = audioFile
+
+            val muxedFile = File(context.cacheDir, "temp_muxed.mp4")
+            if (muxedFile.exists()) muxedFile.delete()
+            tempMuxedFile = muxedFile
+
+            // Start recording audio from the Rust Ring Buffer via the encoder
+            audioEncoder.start(audioFile, 48000, 1)
+
+            // Prepare video-only recording
+            val fileOutputOptions = FileOutputOptions.Builder(videoFile).build()
+            videoCapture.output.prepareRecording(context, fileOutputOptions)
+        } else {
+            Log.d(TAG, "Iniciando gravação padrão (microfone interno)...")
+            val mediaStoreOutputOptions = MediaStoreOutputOptions
+                .Builder(context.contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                .setContentValues(contentValues)
+                .build()
+            videoCapture.output.prepareRecording(context, mediaStoreOutputOptions)
+                .withAudioEnabled()
+        }
+
+        Log.d(TAG, "Botão pressionado. Iniciando processo de gravação...")
 
         recording = pendingRecording.start(ContextCompat.getMainExecutor(context)) { recordEvent ->
+            Log.d(TAG, "Event recebido: ${recordEvent::class.java.simpleName}")
             when(recordEvent) {
                 is VideoRecordEvent.Start -> {
+                    Log.d(TAG, "Gravação iniciada com sucesso no Recorder")
                     onRecordingStateChanged(true)
                 }
                 is VideoRecordEvent.Finalize -> {
                     onRecordingStateChanged(false)
+                    if (isUsingUsbMicDuringRecording) {
+                        audioEncoder.stop()
+                    }
+
                     if (!recordEvent.hasError()) {
-                        val msg = "Video capture succeeded"
-                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                        Log.d(TAG, "Video capture saved at: ${recordEvent.outputResults.outputUri}")
+                        if (isUsingUsbMicDuringRecording) {
+                            // Mux video and audio in a background thread
+                            Thread {
+                                val vFile = tempVideoFile
+                                val aFile = tempAudioFile
+                                val mFile = tempMuxedFile
+                                val cValues = pendingContentValues
+
+                                if (vFile != null && aFile != null && mFile != null && cValues != null) {
+                                    val muxSuccess = MuxerHelper.muxVideoAndAudio(vFile, aFile, mFile)
+                                    if (muxSuccess) {
+                                        try {
+                                            val finalUri = context.contentResolver.insert(
+                                                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                                                cValues
+                                            )
+                                            if (finalUri != null) {
+                                                context.contentResolver.openOutputStream(finalUri)?.use { out ->
+                                                    mFile.inputStream().use { input ->
+                                                        input.copyTo(out)
+                                                    }
+                                                }
+                                                ContextCompat.getMainExecutor(context).execute {
+                                                    Toast.makeText(context, "Video saved successfully!", Toast.LENGTH_SHORT).show()
+                                                }
+                                                Log.d(TAG, "Muxed video successfully saved to MediaStore: $finalUri")
+                                            } else {
+                                                Log.e(TAG, "Could not insert final video record into MediaStore.")
+                                            }
+                                        } catch (e: Exception) {
+                                            Log.e(TAG, "Failed to copy muxed file to MediaStore", e)
+                                        }
+                                    } else {
+                                        Log.e(TAG, "Failed to mux temporary video and audio files.")
+                                    }
+                                    // Clean up cache
+                                    vFile.delete()
+                                    aFile.delete()
+                                    mFile.delete()
+                                }
+                            }.start()
+                        } else {
+                            val msg = "Video capture succeeded"
+                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                            Log.d(TAG, "Vídeo finalizado padrão: ${recordEvent.outputResults.outputUri}")
+                        }
                     } else {
                         recording?.close()
                         recording = null
-                        Log.e(TAG, "Video capture ends with error: ${recordEvent.error}")
+                        Log.e(TAG, "Erro na gravação: Código ${recordEvent.error} - Details: ${recordEvent.cause?.message}")
                         Toast.makeText(context, "Recording failed", Toast.LENGTH_SHORT).show()
+                        
+                        // Clean up temporary files on error
+                        if (isUsingUsbMicDuringRecording) {
+                            tempVideoFile?.delete()
+                            tempAudioFile?.delete()
+                            tempMuxedFile?.delete()
+                        }
                     }
                 }
             }

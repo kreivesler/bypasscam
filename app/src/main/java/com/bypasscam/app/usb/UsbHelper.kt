@@ -7,19 +7,25 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbDeviceConnection
+import android.hardware.usb.UsbEndpoint
+import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
+import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /**
  * Helper class to manage USB Audio device connections.
- * This class detects when a USB_CLASS_AUDIO device is connected
- * and requests permission to use it.
+ * This class detects when a USB_CLASS_AUDIO device is connected,
+ * claims its interface, and starts the Rust user-space driver.
  */
 class UsbHelper(private val context: Context) {
 
     private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+    private var usbConnection: UsbDeviceConnection? = null
+    private var claimedInterface: UsbInterface? = null
     
     private val _isUsbMicConnected = MutableStateFlow(false)
     val isUsbMicConnected: StateFlow<Boolean> = _isUsbMicConnected
@@ -63,7 +69,7 @@ class UsbHelper(private val context: Context) {
                     }
                     device?.let {
                         if (isAudioDevice(it)) {
-                            _isUsbMicConnected.value = false
+                            stopUsbAudioDriver()
                         }
                     }
                 }
@@ -99,12 +105,15 @@ class UsbHelper(private val context: Context) {
         if (!isAudioDevice(device)) return
         
         if (!usbManager.hasPermission(device)) {
+            val intent = Intent(actionUsbPermission).apply {
+                setPackage(context.packageName)
+            }
             val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             } else {
                 PendingIntent.FLAG_UPDATE_CURRENT
             }
-            val permissionIntent = PendingIntent.getBroadcast(context, 0, Intent(actionUsbPermission), flags)
+            val permissionIntent = PendingIntent.getBroadcast(context, 0, intent, flags)
             usbManager.requestPermission(device, permissionIntent)
         } else {
             checkAndSetUsbAudioDevice(device)
@@ -113,8 +122,90 @@ class UsbHelper(private val context: Context) {
 
     private fun checkAndSetUsbAudioDevice(device: UsbDevice) {
         if (isAudioDevice(device)) {
-            _isUsbMicConnected.value = true
+            val details = findAudioInputDetails(device)
+            if (details != null) {
+                val (usbInterface, endpoint) = details
+                try {
+                    val connection = usbManager.openDevice(device)
+                    if (connection != null) {
+                        if (connection.claimInterface(usbInterface, true)) {
+                            usbConnection = connection
+                            claimedInterface = usbInterface
+                            val fd = connection.fileDescriptor
+                            
+                            // Start Rust USB Audio Driver
+                            // Parameters: fd, interface index, endpoint address, 48kHz, 1 (Mono)
+                            val started = BypassAudioJni.startAudioStream(
+                                fd,
+                                usbInterface.id,
+                                endpoint.address,
+                                48000,
+                                1
+                            )
+                            if (started) {
+                                _isUsbMicConnected.value = true
+                                Log.i("UsbHelper", "Successfully initialized Rust USB Audio Class Driver (fd=$fd)")
+                            } else {
+                                Log.e("UsbHelper", "Rust driver failed to start.")
+                                connection.releaseInterface(usbInterface)
+                                connection.close()
+                                usbConnection = null
+                                claimedInterface = null
+                            }
+                        } else {
+                            Log.e("UsbHelper", "Failed to claim USB interface.")
+                            connection.close()
+                        }
+                    } else {
+                        Log.e("UsbHelper", "Failed to open USB device connection.")
+                    }
+                } catch (e: Exception) {
+                    Log.e("UsbHelper", "Error establishing USB device connection", e)
+                }
+            } else {
+                Log.w("UsbHelper", "No suitable audio input endpoint found on device.")
+            }
         }
+    }
+
+    private fun findAudioInputDetails(device: UsbDevice): Pair<UsbInterface, UsbEndpoint>? {
+        for (i in 0 until device.interfaceCount) {
+            val usbInterface = device.getInterface(i)
+            // Class 1 is USB Audio
+            if (usbInterface.interfaceClass == UsbConstants.USB_CLASS_AUDIO) {
+                for (j in 0 until usbInterface.endpointCount) {
+                    val endpoint = usbInterface.getEndpoint(j)
+                    // We need input streaming endpoint
+                    if (endpoint.direction == UsbConstants.USB_DIR_IN) {
+                        val type = endpoint.type
+                        if (type == UsbConstants.USB_ENDPOINT_XFER_ISOC || type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                            return Pair(usbInterface, endpoint)
+                        }
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    fun stopUsbAudioDriver() {
+        BypassAudioJni.stopAudioStream()
+        try {
+            claimedInterface?.let {
+                usbConnection?.releaseInterface(it)
+            }
+        } catch (e: Exception) {
+            Log.w("UsbHelper", "Error releasing interface: ${e.message}")
+        }
+        try {
+            usbConnection?.close()
+        } catch (e: Exception) {
+            Log.w("UsbHelper", "Error closing connection: ${e.message}")
+        }
+        usbConnection = null
+        claimedInterface = null
+        _isUsbMicConnected.value = false
+        Log.i("UsbHelper", "USB Audio Driver stopped and clean up complete.")
     }
 
     private fun isAudioDevice(device: UsbDevice): Boolean {
@@ -128,6 +219,7 @@ class UsbHelper(private val context: Context) {
     }
 
     fun unregister() {
+        stopUsbAudioDriver()
         try {
             context.unregisterReceiver(usbReceiver)
         } catch (e: IllegalArgumentException) {
