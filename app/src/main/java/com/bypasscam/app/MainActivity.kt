@@ -2,6 +2,9 @@ package com.bypasscam.app
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.content.Intent
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
@@ -52,6 +55,7 @@ class MainActivity : ComponentActivity() {
         
         cameraManager = CameraManager(this)
         usbHelper = UsbHelper(this)
+        cameraManager.usbHelper = usbHelper
 
         if (allPermissionsGranted()) {
             startApp()
@@ -68,9 +72,13 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.background
                 ) {
                     val isUsbMicConnected by usbHelper.isUsbMicConnected.collectAsState()
+                    val usbDeviceInfo by usbHelper.usbDeviceInfo.collectAsState()
+                    val usbChannels by usbHelper.audioChannelsFlow.collectAsState()
                     CameraScreen(
                         cameraManager = cameraManager,
-                        isUsbMicConnected = isUsbMicConnected
+                        isUsbMicConnected = isUsbMicConnected,
+                        usbChannels = usbChannels,
+                        usbDeviceInfo = usbDeviceInfo
                     )
                 }
             }
@@ -79,6 +87,20 @@ class MainActivity : ComponentActivity() {
 
     private fun allPermissionsGranted() = requiredPermissions.all {
         ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+            val device: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+            }
+            device?.let { usbHelper.handleUsbDeviceAttached(it) }
+        }
     }
 
     override fun onDestroy() {
