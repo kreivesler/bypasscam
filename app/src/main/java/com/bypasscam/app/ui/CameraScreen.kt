@@ -22,11 +22,12 @@ import androidx.compose.ui.unit.sp
 @Composable
 fun CameraScreen(
     cameraManager: CameraManager,
-    isUsbMicConnected: Boolean
+    isUsbMicConnected: Boolean,
+    usbChannels: Int = 2,
+    usbDeviceInfo: String = ""
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     var isRecording by remember { mutableStateOf(false) }
-    var key by remember { mutableStateOf(0) } // Used to force preview refresh when switching camera
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
         // Camera Preview
@@ -37,11 +38,7 @@ fun CameraScreen(
                 cameraManager.startCamera(lifecycleOwner, previewView.surfaceProvider)
                 previewView
             },
-            modifier = Modifier.fillMaxSize(),
-            update = { previewView ->
-                // Ensure camera binds correctly if key changes
-                cameraManager.startCamera(lifecycleOwner, previewView.surfaceProvider)
-            }
+            modifier = Modifier.fillMaxSize()
         )
 
         // Top Status Bar: USB Connection Indicator
@@ -54,15 +51,26 @@ fun CameraScreen(
         ) {
             Surface(
                 shape = RoundedCornerShape(16.dp),
-                color = Color.Black.copy(alpha = 0.6f)
+                color = Color.Black.copy(alpha = 0.75f)
             ) {
-                Text(
-                    text = if (isUsbMicConnected) "USB Mic: Connected" else "USB Mic: Disconnected",
-                    color = if (isUsbMicConnected) Color.Green else Color.Red,
-                    fontWeight = FontWeight.Bold,
+                Column(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                    fontSize = 12.sp
-                )
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = if (isUsbMicConnected) "USB Mic: Connected" else "USB Mic: Disconnected",
+                        color = if (isUsbMicConnected) Color(0xFF00E676) else Color.Red,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp
+                    )
+                    if (isUsbMicConnected && usbDeviceInfo.isNotBlank()) {
+                        Text(
+                            text = usbDeviceInfo,
+                            color = Color.White.copy(alpha = 0.85f),
+                            fontSize = 10.sp
+                        )
+                    }
+                }
             }
         }
 
@@ -75,11 +83,10 @@ fun CameraScreen(
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Switch Camera
+            // Switch Camera lens (Front / Rear)
             Button(
                 onClick = {
-                    cameraManager.isFrontCamera = !cameraManager.isFrontCamera
-                    key++ // Trigger recomposition for AndroidView
+                    cameraManager.flipCamera(lifecycleOwner)
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.4f)),
                 modifier = Modifier.border(width = 2.dp, color = Color.White, shape = RoundedCornerShape(8.dp)),
@@ -95,13 +102,13 @@ fun CameraScreen(
                 modifier = Modifier.size(76.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Color.White)
             ) {
-                Text("SNAP", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 9.sp)
+                Text("PHOTO", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 11.sp)
             }
 
             // Record Video
             Button(
                 onClick = {
-                    cameraManager.toggleRecording(isUsbMicConnected) { recordingState ->
+                    cameraManager.toggleRecording(isUsbMicConnected, usbChannels) { recordingState ->
                         isRecording = recordingState
                     }
                 },
