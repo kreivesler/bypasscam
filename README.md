@@ -90,11 +90,11 @@ The code is free for commercial use, modification, and private or public distrib
 > Any application, commercial product, library, or distribution that incorporates or derives from this software must include the copyright notice and credit attribution in its legal notices, open-source license screens, help files, or technical documentation. No visual banner or logo is required on the main user interface.
 >
 > **Suggested Credit Text:**
-> *"USB audio capture technology by ByPassCam (rileysolucoes.com.br)"*
+> *"USB audio capture technology by ByPassCam (kreive.com.br)"*
 
 ### Corporate Information
-* **Provided by:** KR RILEY SOLUÇÕES
-* **Official Website:** [rileysolucoes.com.br](https://rileysolucoes.com.br)
+* **Provided by:** Kreive Tech
+* **Official Website:** [kreive.com.br](https://kreive.com.br)
 * **Headquarters:** Viçosa - MG, Brazil
 * **Founder:** Kreivesler Riley
 * **General License:** MIT License (see the `LICENSE` file for details).
