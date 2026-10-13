@@ -14,5 +14,7 @@
 .cxx
 local.properties
 /bypass-audio-rust/target
+*.jks
+*.keystore
 
 
