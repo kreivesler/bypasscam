@@ -14,11 +14,11 @@ android {
     ndkVersion = "26.1.10909125"
 
     defaultConfig {
-        applicationId = "com.bypasscam.app"
+        applicationId = "br.com.kreive.bypasscam"
         minSdk = 33
         targetSdk = 35
         versionCode = 1
-        versionName = "1.0"
+        versionName = "0.1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -120,7 +120,7 @@ tasks.register("buildRust") {
             val cargoBin = "$homeDir/.cargo/bin"
             val currentPath = System.getenv("PATH") ?: ""
             pb.environment()["PATH"] = "$cargoBin:$currentPath"
-            
+
             val process = pb.start()
             val exitCode = process.waitFor()
             if (exitCode != 0) {

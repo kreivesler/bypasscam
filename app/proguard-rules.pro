@@ -19,3 +19,9 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# Preserve JNI bindings and native methods for Rust UAC driver
+-keep class com.bypasscam.app.usb.BypassAudioJni { *; }
+-keepclasseswithmembernames class * {
+    native <methods>;
+}
