@@ -22,6 +22,8 @@
         android:theme="@style/Theme.BypassCam">
         <activity
             android:name=".MainActivity"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation"
             android:foregroundServiceType="camera|microphone"
             android:exported="true">
             <intent-filter>
