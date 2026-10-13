@@ -20,10 +20,27 @@ object MuxerHelper {
         val videoExtractor = MediaExtractor()
         val audioExtractor = MediaExtractor()
         var muxer: MediaMuxer? = null
+        var muxerStarted = false
+        var hasAudioSource = false
         
         try {
+            if (!videoFile.exists() || videoFile.length() == 0L) {
+                Log.e(TAG, "Video file does not exist or is empty")
+                return false
+            }
+
             videoExtractor.setDataSource(videoFile.absolutePath)
-            audioExtractor.setDataSource(audioFile.absolutePath)
+
+            if (audioFile.exists() && audioFile.length() > 0L) {
+                try {
+                    audioExtractor.setDataSource(audioFile.absolutePath)
+                    hasAudioSource = true
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not open audio file datasource: ${e.message}")
+                }
+            } else {
+                Log.w(TAG, "Audio file is missing or 0 bytes, proceeding with video only")
+            }
 
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
@@ -37,28 +54,44 @@ object MuxerHelper {
                     videoExtractor.selectTrack(i)
                     videoSourceTrack = i
                     videoTrackIndex = muxer.addTrack(format)
+
+                    // Preserve video rotation / orientation hint from source video
+                    if (format.containsKey(MediaFormat.KEY_ROTATION)) {
+                        val rotation = format.getInteger(MediaFormat.KEY_ROTATION)
+                        muxer.setOrientationHint(rotation)
+                        Log.d(TAG, "Applied video orientation hint: $rotation degrees")
+                    }
+
                     Log.d(TAG, "Video track identified at index $i, added to muxer.")
                     break
                 }
             }
 
-            // 2. Identify and add audio track
+            if (videoTrackIndex == -1) {
+                Log.e(TAG, "No video track found in source video file")
+                return false
+            }
+
+            // 2. Identify and add audio track (if available)
             var audioTrackIndex = -1
             var audioSourceTrack = -1
-            for (i in 0 until audioExtractor.trackCount) {
-                val format = audioExtractor.getTrackFormat(i)
-                val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
-                if (mime.startsWith("audio/")) {
-                    audioExtractor.selectTrack(i)
-                    audioSourceTrack = i
-                    audioTrackIndex = muxer.addTrack(format)
-                    Log.d(TAG, "Audio track identified at index $i, added to muxer.")
-                    break
+            if (hasAudioSource) {
+                for (i in 0 until audioExtractor.trackCount) {
+                    val format = audioExtractor.getTrackFormat(i)
+                    val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+                    if (mime.startsWith("audio/")) {
+                        audioExtractor.selectTrack(i)
+                        audioSourceTrack = i
+                        audioTrackIndex = muxer.addTrack(format)
+                        Log.d(TAG, "Audio track identified at index $i, added to muxer.")
+                        break
+                    }
                 }
             }
 
             // Start the muxer
             muxer.start()
+            muxerStarted = true
 
             val buffer = ByteBuffer.allocate(1024 * 1024)
             val bufferInfo = MediaCodec.BufferInfo()
@@ -101,10 +134,12 @@ object MuxerHelper {
             Log.e(TAG, "Failed to mux video and audio tracks", e)
             return false
         } finally {
-            try {
-                muxer?.stop()
-            } catch (e: Exception) {
-                // Ignore
+            if (muxerStarted) {
+                try {
+                    muxer?.stop()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error stopping muxer: ${e.message}")
+                }
             }
             try {
                 muxer?.release()
@@ -112,7 +147,9 @@ object MuxerHelper {
                 // Ignore
             }
             videoExtractor.release()
-            audioExtractor.release()
+            if (hasAudioSource) {
+                audioExtractor.release()
+            }
         }
     }
 }
