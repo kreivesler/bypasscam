@@ -21,6 +21,9 @@ object BypassAudioJni {
      * @param endpointAddress The endpoint address to read audio from.
      * @param sampleRate The sample rate of the audio (e.g. 48000, 44100).
      * @param channels The number of channels (1 = mono, 2 = stereo).
+     * @param maxPacketSize The physical max packet size from the USB endpoint.
+     * @param altSetting The alternate setting number to activate for streaming.
+     * @param endpointType The transfer type of the endpoint (1 = ISOC, 2 = BULK).
      * @return true if successful, false otherwise.
      */
     external fun startAudioStream(
@@ -28,7 +31,10 @@ object BypassAudioJni {
         interfaceIndex: Int,
         endpointAddress: Int,
         sampleRate: Int,
-        channels: Int
+        channels: Int,
+        maxPacketSize: Int,
+        altSetting: Int,
+        endpointType: Int
     ): Boolean
 
     /**
@@ -43,4 +49,9 @@ object BypassAudioJni {
      * @return The actual number of bytes read, or 0 if no data is available.
      */
     external fun readAudioData(buffer: ByteArray, sizeInBytes: Int): Int
+
+    /**
+     * Retrieves kernel ioctl and ring buffer telemetry statistics from the Rust driver.
+     */
+    external fun getDriverStatus(): String
 }
