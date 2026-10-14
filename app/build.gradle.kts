@@ -10,15 +10,15 @@ plugins {
 
 android {
     namespace = "com.bypasscam.app"
-    compileSdk = 35 // Ajustado para a versão estável mais comum de 2026
+    compileSdk = 36
     ndkVersion = "26.1.10909125"
 
     defaultConfig {
         applicationId = "br.com.kreive.bypasscam"
         minSdk = 33
-        targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.3"
+        targetSdk = 36
+        versionCode = 2
+        versionName = "0.1.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -116,6 +116,7 @@ tasks.register("buildRust") {
                 .directory(File(projectDir.parentFile, "bypass-audio-rust"))
                 .inheritIO()
             pb.environment()["ANDROID_NDK_HOME"] = ndkDir
+            pb.environment()["RUSTFLAGS"] = "-C link-arg=-Wl,-z,max-page-size=16384"
             val homeDir = System.getProperty("user.home")
             val cargoBin = "$homeDir/.cargo/bin"
             val currentPath = System.getenv("PATH") ?: ""

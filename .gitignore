@@ -16,5 +16,4 @@ local.properties
 /bypass-audio-rust/target
 *.jks
 *.keystore
-
-
+/assets/screenshot-*.png

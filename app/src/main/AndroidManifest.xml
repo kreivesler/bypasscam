@@ -9,9 +9,6 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- WRITE_EXTERNAL_STORAGE is required for devices running Android 9 (API 28) and lower -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 
     <application
         android:allowBackup="true"
@@ -24,7 +21,6 @@
             android:name=".MainActivity"
             android:launchMode="singleTop"
             android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation"
-            android:foregroundServiceType="camera|microphone"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
