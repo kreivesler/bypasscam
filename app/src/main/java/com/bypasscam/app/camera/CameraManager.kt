@@ -41,14 +41,21 @@ class CameraManager(private val context: Context) {
     var usbHelper: UsbHelper? = null
     private var isUsingUsbMicDuringRecording = false
     private val audioEncoder = AudioEncoder()
-    private var tempVideoFile: File? = null
+    private val tempVideoSegments = mutableListOf<File>()
     private var tempAudioFile: File? = null
     private var tempMuxedFile: File? = null
     private var pendingContentValues: ContentValues? = null
+    
+    // Multi-segment flip during recording variables
+    private var isSessionRecording = false
+    private var isFlippingDuringRecording = false
+    private var currentChannels = 2
+    private var onRecordingStateCallback: ((Boolean) -> Unit)? = null
 
     fun startCamera(
         lifecycleOwner: LifecycleOwner,
-        surfaceProvider: Preview.SurfaceProvider
+        surfaceProvider: Preview.SurfaceProvider,
+        onReady: (() -> Unit)? = null
     ) {
         this.currentSurfaceProvider = surfaceProvider
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
@@ -120,21 +127,33 @@ class CameraManager(private val context: Context) {
                 }
             }
 
+            onReady?.invoke()
         }, ContextCompat.getMainExecutor(context))
     }
 
     /**
      * Toggles between front and rear cameras safely.
+     * If recording is currently active, it smoothly transitions to the other camera lens
+     * without stopping the overall recording session.
      */
     fun flipCamera(lifecycleOwner: LifecycleOwner) {
-        if (recording != null) {
-            Log.w(TAG, "Cannot flip camera while recording is active")
-            Toast.makeText(context, "Cannot switch camera during recording", Toast.LENGTH_SHORT).show()
+        val surfaceProvider = currentSurfaceProvider ?: run {
+            Log.e(TAG, "Surface provider not initialized yet")
             return
         }
 
-        val surfaceProvider = currentSurfaceProvider ?: run {
-            Log.e(TAG, "Surface provider not initialized yet")
+        if (isSessionRecording) {
+            Log.d(TAG, "Flip requested during active recording. Performing seamless camera switch...")
+            isFlippingDuringRecording = true
+            // Stop current segment recording; finalize listener will switch camera lens and start next segment
+            recording?.stop()
+            recording = null
+            
+            isFrontCamera = !isFrontCamera
+            startCamera(lifecycleOwner, surfaceProvider) {
+                // Once new camera is bound, start next segment recording
+                startNextVideoSegment()
+            }
             return
         }
 
@@ -195,10 +214,11 @@ class CameraManager(private val context: Context) {
             return
         }
 
-        val curRecording = recording
-        if (curRecording != null) {
-            Log.d(TAG, "Parando gravação ativa...")
-            curRecording.stop()
+        if (isSessionRecording) {
+            Log.d(TAG, "Parando sessão de gravação ativa...")
+            isSessionRecording = false
+            isFlippingDuringRecording = false
+            recording?.stop()
             recording = null
             if (isUsingUsbMicDuringRecording) {
                 audioEncoder.stop()
@@ -217,208 +237,228 @@ class CameraManager(private val context: Context) {
             put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/BypassCam")
         }
 
+        isSessionRecording = true
+        isFlippingDuringRecording = false
         isUsingUsbMicDuringRecording = isUsbMicConnected
         pendingContentValues = contentValues
+        currentChannels = channels
+        onRecordingStateCallback = onRecordingStateChanged
 
-        val pendingRecording = if (isUsbMicConnected) {
-            Log.d(TAG, "Iniciando gravação com bypass de driver USB genérico...")
-            
-            // Wake up microphone hardware and start audio streaming now that REC is pressed
+        // Clear previous video segments
+        tempVideoSegments.clear()
+
+        // Set up temp cache files
+        val audioFile = File(context.cacheDir, "temp_audio.mp4")
+        if (audioFile.exists()) audioFile.delete()
+        tempAudioFile = audioFile
+
+        val muxedFile = File(context.cacheDir, "temp_muxed.mp4")
+        if (muxedFile.exists()) muxedFile.delete()
+        tempMuxedFile = muxedFile
+
+        if (isUsbMicConnected) {
+            Log.d(TAG, "Iniciando sessão com bypass de driver USB...")
             usbHelper?.startMicStreaming()
-
-            // Set up temp cache files
-            val videoFile = File(context.cacheDir, "temp_video.mp4")
-            if (videoFile.exists()) videoFile.delete()
-            tempVideoFile = videoFile
-
-            val audioFile = File(context.cacheDir, "temp_audio.mp4")
-            if (audioFile.exists()) audioFile.delete()
-            tempAudioFile = audioFile
-
-            val muxedFile = File(context.cacheDir, "temp_muxed.mp4")
-            if (muxedFile.exists()) muxedFile.delete()
-            tempMuxedFile = muxedFile
-
-            // Start recording audio from the Rust Ring Buffer via the encoder
             val sampleRate = usbHelper?.audioSampleRate ?: 48000
             val micChannels = usbHelper?.audioChannels ?: channels
             Log.i(TAG, "Starting AudioEncoder with dynamic sampleRate=$sampleRate, micChannels=$micChannels")
             audioEncoder.start(audioFile, sampleRate, micChannels)
-
-            // Prepare video-only recording
-            val fileOutputOptions = FileOutputOptions.Builder(videoFile).build()
-            videoCapture.output.prepareRecording(context, fileOutputOptions)
         } else {
-            Log.d(TAG, "Iniciando gravação padrão (microfone interno)...")
-            val mediaStoreOutputOptions = MediaStoreOutputOptions
-                .Builder(context.contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-                .setContentValues(contentValues)
-                .build()
-            videoCapture.output.prepareRecording(context, mediaStoreOutputOptions)
-                .withAudioEnabled()
+            Log.d(TAG, "Iniciando sessão padrão com microfone interno...")
         }
 
-        Log.d(TAG, "Botão pressionado. Iniciando processo de gravação...")
+        startNextVideoSegment()
+    }
+
+    /**
+     * Starts a new video segment recording.
+     */
+    @SuppressLint("MissingPermission")
+    private fun startNextVideoSegment() {
+        if (!isSessionRecording) return
+
+        val videoCapture = this.videoCapture ?: run {
+            Log.e(TAG, "videoCapture nulo ao iniciar segmento!")
+            return
+        }
+
+        val segmentIndex = tempVideoSegments.size
+        val segmentFile = File(context.cacheDir, "temp_video_seg_$segmentIndex.mp4")
+        if (segmentFile.exists()) segmentFile.delete()
+        tempVideoSegments.add(segmentFile)
+
+        val fileOutputOptions = FileOutputOptions.Builder(segmentFile).build()
+        val pendingRecording = if (!isUsingUsbMicDuringRecording) {
+            videoCapture.output.prepareRecording(context, fileOutputOptions).withAudioEnabled()
+        } else {
+            videoCapture.output.prepareRecording(context, fileOutputOptions)
+        }
+
+        Log.d(TAG, "Iniciando segmento de vídeo #$segmentIndex (${segmentFile.name})...")
 
         recording = pendingRecording.start(ContextCompat.getMainExecutor(context)) { recordEvent ->
-            Log.d(TAG, "Event recebido: ${recordEvent::class.java.simpleName}")
-            when(recordEvent) {
+            when (recordEvent) {
                 is VideoRecordEvent.Start -> {
-                    Log.d(TAG, "Gravação iniciada com sucesso no Recorder")
-                    onRecordingStateChanged(true)
+                    Log.d(TAG, "Segmento #$segmentIndex iniciado com sucesso")
+                    isFlippingDuringRecording = false
+                    onRecordingStateCallback?.invoke(true)
                 }
                 is VideoRecordEvent.Finalize -> {
-                    onRecordingStateChanged(false)
-                    if (isUsingUsbMicDuringRecording) {
-                        audioEncoder.stop()
-                        usbHelper?.stopMicStreaming()
+                    Log.d(TAG, "Segmento #$segmentIndex finalizado (error: ${recordEvent.hasError()})")
+                    if (isFlippingDuringRecording) {
+                        Log.d(TAG, "Segmento finalizado devido a flip de câmera. Aguardando próximo segmento...")
+                        return@start
                     }
 
-                    if (!recordEvent.hasError()) {
+                    if (!isSessionRecording) {
+                        // User pressed STOP: finalize complete video
+                        onRecordingStateCallback?.invoke(false)
                         if (isUsingUsbMicDuringRecording) {
-                            // Mux video and audio in a background thread
-                            Thread {
-                                val vFile = tempVideoFile
-                                val aFile = tempAudioFile
-                                val mFile = tempMuxedFile
-                                val cValues = pendingContentValues
-
-                                if (vFile != null && aFile != null && mFile != null && cValues != null) {
-                                    val baseName = cValues.getAsString(MediaStore.MediaColumns.DISPLAY_NAME) ?: "BypassCam_${System.currentTimeMillis()}"
-
-                                    // 1. Mux video and audio
-                                    val muxSuccess = MuxerHelper.muxVideoAndAudio(vFile, aFile, mFile)
-                                    val fileToSave = if (muxSuccess && mFile.exists() && mFile.length() > 0L) {
-                                        mFile
-                                    } else {
-                                        Log.w(TAG, "Muxing was not successful or produced empty file. Falling back to video-only track.")
-                                        vFile
-                                    }
-
-                                    var videoSavedSuccessfully = false
-                                    try {
-                                        val finalUri = context.contentResolver.insert(
-                                            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                                            cValues
-                                        )
-                                        if (finalUri != null) {
-                                            context.contentResolver.openOutputStream(finalUri)?.use { out ->
-                                                fileToSave.inputStream().use { input ->
-                                                    input.copyTo(out)
-                                                }
-                                            }
-                                            videoSavedSuccessfully = true
-                                            Log.d(TAG, "Video successfully saved to MediaStore: $finalUri")
-                                        } else {
-                                            Log.e(TAG, "Could not insert final video record into MediaStore.")
-                                        }
-                                    } catch (e: Exception) {
-                                        Log.e(TAG, "Failed to copy video file to MediaStore", e)
-                                    }
-
-                                    // 2. Save standalone audio file separately in Movies/BypassCam
-                                    // User requirement: save audio separately even though muxed, allowing direct audio inspection
-                                    var audioSavedSuccessfully = false
-                                    if (aFile.exists()) {
-                                        try {
-                                            val audioValues = ContentValues().apply {
-                                                put(MediaStore.MediaColumns.DISPLAY_NAME, "${baseName}_audio.mp4")
-                                                put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-                                                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/BypassCam")
-                                            }
-                                            val audioUri = context.contentResolver.insert(
-                                                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                                                audioValues
-                                            )
-                                            if (audioUri != null) {
-                                                context.contentResolver.openOutputStream(audioUri)?.use { out ->
-                                                    aFile.inputStream().use { input ->
-                                                        input.copyTo(out)
-                                                    }
-                                                }
-                                                audioSavedSuccessfully = true
-                                                Log.d(TAG, "Standalone audio file successfully saved to MediaStore: $audioUri (${aFile.length()} bytes)")
-                                            } else {
-                                                Log.e(TAG, "Could not insert standalone audio record into MediaStore.")
-                                            }
-                                        } catch (e: Exception) {
-                                            Log.e(TAG, "Failed to save standalone audio file to MediaStore", e)
-                                        }
-                                    }
-
-                                    // 3. Audio observation report .txt generation
-                                    // Generate diagnostic log with complete hardware audit and kernel telemetry
-                                    val isAudioReceived = audioEncoder.isAudioArriving && audioEncoder.totalBytesRead > 0L
-                                    var logSavedSuccessfully = false
-                                    try {
-                                        val audit = usbHelper?.hardwareAuditText ?: ""
-                                        val jniStatus = try {
-                                            com.bypasscam.app.usb.BypassAudioJni.getDriverStatus()
-                                        } catch (e: Throwable) {
-                                            "Error reading JNI status: ${e.message}"
-                                        }
-                                        val logContent = audioEncoder.generateObservationReport(audit, jniStatus)
-
-                                        val logValues = ContentValues().apply {
-                                            put(MediaStore.MediaColumns.DISPLAY_NAME, "${baseName}_audio_log.txt")
-                                            put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
-                                            put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/BypassCam")
-                                        }
-                                        val logUri = context.contentResolver.insert(
-                                            MediaStore.Files.getContentUri("external"),
-                                            logValues
-                                        )
-                                        if (logUri != null) {
-                                            context.contentResolver.openOutputStream(logUri)?.use { out ->
-                                                out.write(logContent.toByteArray(Charsets.UTF_8))
-                                            }
-                                            logSavedSuccessfully = true
-                                            Log.d(TAG, "Audio observation diagnostic log saved to MediaStore: $logUri")
-                                        } else {
-                                            Log.e(TAG, "Could not insert audio log record into MediaStore.")
-                                        }
-                                    } catch (e: Exception) {
-                                        Log.e(TAG, "Failed to save audio observation log to MediaStore", e)
-                                    }
-
-                                    // User notification Toast
-                                    ContextCompat.getMainExecutor(context).execute {
-                                        val feedbackMsg = when {
-                                            videoSavedSuccessfully && isAudioReceived ->
-                                                "Video, audio & log saved to Movies/BypassCam"
-                                            videoSavedSuccessfully ->
-                                                "Video saved (0B audio). Diagnostic log created!"
-                                            else ->
-                                                "Failed to save video to gallery"
-                                        }
-                                        Toast.makeText(context, feedbackMsg, Toast.LENGTH_LONG).show()
-                                    }
-
-                                    // Only delete temporary files when the definitive video was saved successfully
-                                    if (videoSavedSuccessfully) {
-                                        vFile.delete()
-                                        aFile.delete()
-                                        mFile.delete()
-                                        Log.d(TAG, "Temporary cache files cleaned up after successful definitive save")
-                                    } else {
-                                        Log.w(TAG, "Definitive save failed; retaining temp cache files for recovery")
-                                    }
-                                }
-                            }.start()
-                        } else {
-                            val msg = "Video saved to Movies/BypassCam"
-                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                            Log.d(TAG, "Standard video finalized: ${recordEvent.outputResults.outputUri}")
+                            audioEncoder.stop()
+                            usbHelper?.stopMicStreaming()
                         }
-                    } else {
-                        recording?.close()
-                        recording = null
-                        Log.e(TAG, "Recording error: Code ${recordEvent.error} - Details: ${recordEvent.cause?.message}")
-                        Toast.makeText(context, "Recording failed: error ${recordEvent.error}", Toast.LENGTH_SHORT).show()
+
+                        if (!recordEvent.hasError()) {
+                            finalizeAndSaveSession()
+                        } else {
+                            recording?.close()
+                            recording = null
+                            Log.e(TAG, "Recording error: Code ${recordEvent.error} - Details: ${recordEvent.cause?.message}")
+                            Toast.makeText(context, "Recording failed: error ${recordEvent.error}", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Concatenates all recorded video segments and muxes with the audio track into a single definitive video.
+     */
+    private fun finalizeAndSaveSession() {
+        Thread {
+            val validSegments = tempVideoSegments.filter { it.exists() && it.length() > 0L }
+            val aFile = tempAudioFile
+            val mFile = tempMuxedFile
+            val cValues = pendingContentValues
+
+            if (validSegments.isNotEmpty() && cValues != null) {
+                val baseName = cValues.getAsString(MediaStore.MediaColumns.DISPLAY_NAME) ?: "BypassCam_${System.currentTimeMillis()}"
+
+                // 1. Mux video segments and audio into a single MP4
+                val muxSuccess = if (mFile != null && aFile != null) {
+                    MuxerHelper.muxVideoAndAudio(validSegments, aFile, mFile)
+                } else false
+
+                val fileToSave = if (muxSuccess && mFile != null && mFile.exists() && mFile.length() > 0L) {
+                    mFile
+                } else {
+                    Log.w(TAG, "Muxing was not successful or produced empty file. Falling back to first video segment.")
+                    validSegments[0]
+                }
+
+                var videoSavedSuccessfully = false
+                try {
+                    val finalUri = context.contentResolver.insert(
+                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                        cValues
+                    )
+                    if (finalUri != null) {
+                        context.contentResolver.openOutputStream(finalUri)?.use { out ->
+                            fileToSave.inputStream().use { input ->
+                                input.copyTo(out)
+                            }
+                        }
+                        videoSavedSuccessfully = true
+                        Log.d(TAG, "Video with ${validSegments.size} segments successfully saved to MediaStore: $finalUri")
+                    } else {
+                        Log.e(TAG, "Could not insert final video record into MediaStore.")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to copy video file to MediaStore", e)
+                }
+
+                // 2. Save standalone audio file separately in Movies/BypassCam if USB mic was used
+                if (isUsingUsbMicDuringRecording && aFile != null && aFile.exists()) {
+                    try {
+                        val audioValues = ContentValues().apply {
+                            put(MediaStore.MediaColumns.DISPLAY_NAME, "${baseName}_audio.mp4")
+                            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+                            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/BypassCam")
+                        }
+                        val audioUri = context.contentResolver.insert(
+                            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                            audioValues
+                        )
+                        if (audioUri != null) {
+                            context.contentResolver.openOutputStream(audioUri)?.use { out ->
+                                aFile.inputStream().use { input ->
+                                    input.copyTo(out)
+                                }
+                            }
+                            Log.d(TAG, "Standalone audio file saved: $audioUri")
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to save standalone audio file", e)
+                    }
+                }
+
+                // 3. Audio observation report .txt generation
+                val isAudioReceived = audioEncoder.isAudioArriving && audioEncoder.totalBytesRead > 0L
+                if (isUsingUsbMicDuringRecording) {
+                    try {
+                        val audit = usbHelper?.hardwareAuditText ?: ""
+                        val jniStatus = try {
+                            com.bypasscam.app.usb.BypassAudioJni.getDriverStatus()
+                        } catch (e: Throwable) {
+                            "Error reading JNI status: ${e.message}"
+                        }
+                        val logContent = audioEncoder.generateObservationReport(audit, jniStatus)
+
+                        val logValues = ContentValues().apply {
+                            put(MediaStore.MediaColumns.DISPLAY_NAME, "${baseName}_audio_log.txt")
+                            put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                            put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/BypassCam")
+                        }
+                        val logUri = context.contentResolver.insert(
+                            MediaStore.Files.getContentUri("external"),
+                            logValues
+                        )
+                        if (logUri != null) {
+                            context.contentResolver.openOutputStream(logUri)?.use { out ->
+                                out.write(logContent.toByteArray(Charsets.UTF_8))
+                            }
+                            Log.d(TAG, "Audio observation diagnostic log saved: $logUri")
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to save audio observation log", e)
+                    }
+                }
+
+                // User notification Toast
+                ContextCompat.getMainExecutor(context).execute {
+                    val segmentsMsg = if (validSegments.size > 1) " (${validSegments.size} ângulos)" else ""
+                    val feedbackMsg = when {
+                        videoSavedSuccessfully && isAudioReceived ->
+                            "Vídeo$segmentsMsg, áudio & log salvos em Movies/BypassCam"
+                        videoSavedSuccessfully ->
+                            "Vídeo$segmentsMsg salvo na galeria!"
+                        else ->
+                            "Falha ao salvar vídeo na galeria"
+                    }
+                    Toast.makeText(context, feedbackMsg, Toast.LENGTH_LONG).show()
+                }
+
+                // Cleanup temporary files
+                if (videoSavedSuccessfully) {
+                    validSegments.forEach { it.delete() }
+                    aFile?.delete()
+                    mFile?.delete()
+                    tempVideoSegments.clear()
+                    Log.d(TAG, "Temporary cache files cleaned up after successful definitive save")
+                }
+            }
+        }.start()
     }
 
     fun shutdown() {

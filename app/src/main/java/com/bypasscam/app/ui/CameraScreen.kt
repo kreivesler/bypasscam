@@ -95,41 +95,48 @@ fun CameraScreen(
                 Text("Flip", color = Color.White)
             }
 
-            // Capture Photo
-            Button(
-                onClick = { cameraManager.takePhoto() },
-                shape = CircleShape,
-                modifier = Modifier.size(76.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color.White)
+            // Capture Photo (Clean shutter button: outer ring with inner solid circle)
+            Box(
+                modifier = Modifier
+                    .size(76.dp)
+                    .border(width = 4.dp, color = Color.White, shape = CircleShape)
+                    .padding(6.dp),
+                contentAlignment = Alignment.Center
             ) {
-                Text("PHOTO", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                Button(
+                    onClick = { cameraManager.takePhoto() },
+                    shape = CircleShape,
+                    modifier = Modifier.fillMaxSize(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                    contentPadding = PaddingValues(0.dp)
+                ) {}
             }
 
-            // Record Video
-            Button(
-                onClick = {
-                    cameraManager.toggleRecording(isUsbMicConnected, usbChannels) { recordingState ->
-                        isRecording = recordingState
-                    }
-                },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isRecording) Color(0xFFB71C1C) else Color.Red
-                ),
+            // Record Video (Shutter button: Red circle for record, White rounded square for stop)
+            Box(
                 modifier = Modifier
                     .size(76.dp)
                     .border(
-                        width = if (isRecording) 4.dp else 0.dp,
-                        color = if (isRecording) Color.White else Color.Transparent,
+                        width = 4.dp,
+                        color = Color.White,
                         shape = CircleShape
-                    ),
-                shape = CircleShape
+                    )
+                    .padding(if (isRecording) 18.dp else 6.dp),
+                contentAlignment = Alignment.Center
             ) {
-                Text(
-                    text = if (isRecording) "STOP" else "REC",
-                    color = Color.White,
-                    fontSize = if (isRecording) 9.sp else 12.sp,
-                    fontWeight = if (isRecording) FontWeight.ExtraBold else FontWeight.Bold
-                )
+                Button(
+                    onClick = {
+                        cameraManager.toggleRecording(isUsbMicConnected, usbChannels) { recordingState ->
+                            isRecording = recordingState
+                        }
+                    },
+                    shape = if (isRecording) RoundedCornerShape(6.dp) else CircleShape,
+                    modifier = Modifier.fillMaxSize(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isRecording) Color.White else Color.Red
+                    ),
+                    contentPadding = PaddingValues(0.dp)
+                ) {}
             }
         }
     }
