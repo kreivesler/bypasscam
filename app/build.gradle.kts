@@ -17,8 +17,8 @@ android {
         applicationId = "br.com.kreive.bypasscam"
         minSdk = 33
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.1.4"
+        versionCode = 3
+        versionName = "0.1.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -57,6 +57,9 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+        jniLibs {
+            useLegacyPackaging = false
         }
     }
 
