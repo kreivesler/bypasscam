@@ -17,8 +17,8 @@ android {
         applicationId = "br.com.kreive.bypasscam"
         minSdk = 33
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.1.5"
+        versionCode = 4
+        versionName = "0.1.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -90,6 +90,12 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:${cameraxVersion}")
     implementation("androidx.camera:camera-video:${cameraxVersion}")
     implementation("androidx.camera:camera-view:${cameraxVersion}")
+
+    // Media3 Transformer para normalização de orientação e pós-processamento de vídeo
+    val media3Version = "1.5.1"
+    implementation("androidx.media3:media3-transformer:${media3Version}")
+    implementation("androidx.media3:media3-effect:${media3Version}")
+    implementation("androidx.media3:media3-common:${media3Version}")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")

@@ -5,6 +5,8 @@ import android.content.ContentValues
 import android.content.Context
 import android.provider.MediaStore
 import android.util.Log
+import android.view.OrientationEventListener
+import android.view.Surface
 import android.widget.Toast
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -14,6 +16,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.bypasscam.app.usb.AudioEncoder
 import com.bypasscam.app.usb.MuxerHelper
+import com.bypasscam.app.usb.TransformerHelper
 import com.bypasscam.app.usb.UsbHelper
 import java.io.File
 import java.text.SimpleDateFormat
@@ -51,6 +54,36 @@ class CameraManager(private val context: Context) {
     private var isFlippingDuringRecording = false
     private var currentChannels = 2
     private var onRecordingStateCallback: ((Boolean) -> Unit)? = null
+    private var onSegmentFinalizedForFlip: (() -> Unit)? = null
+
+    // Orientation handling for both Portrait and Landscape
+    private var orientationEventListener: OrientationEventListener? = null
+    private var currentTargetRotation: Int = Surface.ROTATION_0
+
+    init {
+        orientationEventListener = object : OrientationEventListener(context) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN) return
+                val newRotation = when (orientation) {
+                    in 45..134 -> Surface.ROTATION_270
+                    in 135..224 -> Surface.ROTATION_180
+                    in 225..314 -> Surface.ROTATION_90
+                    else -> Surface.ROTATION_0
+                }
+                if (newRotation != currentTargetRotation) {
+                    currentTargetRotation = newRotation
+                    imageCapture?.targetRotation = newRotation
+                    // Update video target rotation only between segments or when idle
+                    if (!isSessionRecording || isFlippingDuringRecording) {
+                        videoCapture?.targetRotation = newRotation
+                    }
+                }
+            }
+        }
+        if (orientationEventListener?.canDetectOrientation() == true) {
+            orientationEventListener?.enable()
+        }
+    }
 
     fun startCamera(
         lifecycleOwner: LifecycleOwner,
@@ -70,12 +103,13 @@ class CameraManager(private val context: Context) {
                     it.setSurfaceProvider(surfaceProvider)
                 }
 
-            // ImageCapture configuration
+            // ImageCapture configuration with dynamic target rotation
             imageCapture = ImageCapture.Builder()
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                .setTargetRotation(currentTargetRotation)
                 .build()
 
-            // VideoCapture configuration - Full HD (1080p) with automatic fallback
+            // VideoCapture configuration - Full HD (1080p) with mirror mode for front camera and target rotation
             val qualitySelector = QualitySelector.from(
                 Quality.FHD,
                 FallbackStrategy.lowerQualityOrHigherThan(Quality.FHD)
@@ -86,7 +120,10 @@ class CameraManager(private val context: Context) {
                 .setQualitySelector(qualitySelector)
                 .build()
 
-            videoCapture = VideoCapture.withOutput(recorder)
+            videoCapture = VideoCapture.Builder(recorder)
+                .setTargetRotation(currentTargetRotation)
+                .setMirrorMode(MirrorMode.MIRROR_MODE_ON_FRONT_ONLY)
+                .build()
 
             val targetSelector = if (isFrontCamera) {
                 CameraSelector.DEFAULT_FRONT_CAMERA
@@ -133,8 +170,8 @@ class CameraManager(private val context: Context) {
 
     /**
      * Toggles between front and rear cameras safely.
-     * If recording is currently active, it smoothly transitions to the other camera lens
-     * without stopping the overall recording session.
+     * If recording is currently active, it cleanly finalizes the current segment first,
+     * switches the lens, and starts the next segment without interrupting the audio stream.
      */
     fun flipCamera(lifecycleOwner: LifecycleOwner) {
         val surfaceProvider = currentSurfaceProvider ?: run {
@@ -143,17 +180,17 @@ class CameraManager(private val context: Context) {
         }
 
         if (isSessionRecording) {
-            Log.d(TAG, "Flip requested during active recording. Performing seamless camera switch...")
+            Log.d(TAG, "Flip requested during active recording. Finalizing current segment cleanly...")
             isFlippingDuringRecording = true
-            // Stop current segment recording; finalize listener will switch camera lens and start next segment
+            onSegmentFinalizedForFlip = {
+                Log.d(TAG, "Segment finalized. Switching camera lens now (isFrontCamera was $isFrontCamera)...")
+                isFrontCamera = !isFrontCamera
+                startCamera(lifecycleOwner, surfaceProvider) {
+                    startNextVideoSegment()
+                }
+            }
             recording?.stop()
             recording = null
-            
-            isFrontCamera = !isFrontCamera
-            startCamera(lifecycleOwner, surfaceProvider) {
-                // Once new camera is bound, start next segment recording
-                startNextVideoSegment()
-            }
             return
         }
 
@@ -306,7 +343,10 @@ class CameraManager(private val context: Context) {
                 is VideoRecordEvent.Finalize -> {
                     Log.d(TAG, "Segmento #$segmentIndex finalizado (error: ${recordEvent.hasError()})")
                     if (isFlippingDuringRecording) {
-                        Log.d(TAG, "Segmento finalizado devido a flip de câmera. Aguardando próximo segmento...")
+                        Log.d(TAG, "Segmento finalizado devido a flip de câmera. Executando transição de câmera...")
+                        val action = onSegmentFinalizedForFlip
+                        onSegmentFinalizedForFlip = null
+                        action?.invoke()
                         return@start
                     }
 
@@ -345,13 +385,32 @@ class CameraManager(private val context: Context) {
             if (validSegments.isNotEmpty() && cValues != null) {
                 val baseName = cValues.getAsString(MediaStore.MediaColumns.DISPLAY_NAME) ?: "BypassCam_${System.currentTimeMillis()}"
 
-                // 1. Mux video segments and audio into a single MP4
-                val muxSuccess = if (mFile != null && aFile != null) {
-                    MuxerHelper.muxVideoAndAudio(validSegments, aFile, mFile)
+                // 1. Mux or merge video segments and audio into a single MP4
+                val muxSuccess = if (mFile != null) {
+                    if (validSegments.size == 1) {
+                        if (isUsingUsbMicDuringRecording && aFile != null && aFile.exists()) {
+                            MuxerHelper.muxVideoAndAudio(validSegments, aFile, mFile)
+                        } else {
+                            // Single segment with internal mic: segment is already complete
+                            true
+                        }
+                    } else {
+                        // Multi-segment with flip (front/back in portrait/landscape):
+                        // Use Media3 Transformer to normalize rotations and stitch seamlessly
+                        Log.d(TAG, "Merging ${validSegments.size} video segments with Media3 Transformer...")
+                        TransformerHelper.mergeSegmentsWithAudioSync(
+                            context = context,
+                            videoFiles = validSegments,
+                            audioFile = if (isUsingUsbMicDuringRecording) aFile else null,
+                            outputFile = mFile
+                        )
+                    }
                 } else false
 
                 val fileToSave = if (muxSuccess && mFile != null && mFile.exists() && mFile.length() > 0L) {
                     mFile
+                } else if (validSegments.size == 1 && !isUsingUsbMicDuringRecording) {
+                    validSegments[0]
                 } else {
                     Log.w(TAG, "Muxing was not successful or produced empty file. Falling back to first video segment.")
                     validSegments[0]
@@ -462,6 +521,7 @@ class CameraManager(private val context: Context) {
     }
 
     fun shutdown() {
+        orientationEventListener?.disable()
         cameraExecutor.shutdown()
     }
 
