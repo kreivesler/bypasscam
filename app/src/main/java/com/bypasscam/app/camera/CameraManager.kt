@@ -373,13 +373,12 @@ class CameraManager(private val context: Context) {
             usbHelper?.startMicStreaming()
             val sampleRate = usbHelper?.audioSampleRate ?: 48000
             val micChannels = usbHelper?.audioChannels ?: channels
-            Log.i(TAG, "Starting AudioEncoder with dynamic sampleRate=$sampleRate, micChannels=$micChannels")
-            audioEncoder.start(audioFile, sampleRate, micChannels, startPaused = false)
+            Log.i(TAG, "Starting AudioEncoder in paused state (waiting for camera ready: rate=$sampleRate, channels=$micChannels)...")
+            audioEncoder.start(audioFile, sampleRate, micChannels, startPaused = true)
         } else {
             Log.d(TAG, "Iniciando sessão padrão com microfone interno...")
         }
 
-        startTimer()
         startNextVideoSegment()
     }
 
