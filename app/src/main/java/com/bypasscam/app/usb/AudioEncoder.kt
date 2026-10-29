@@ -73,9 +73,24 @@ class AudioEncoder {
     var totalAudioFramesEncoded: Long = 0L
         private set
 
+    @Volatile
+    var isPaused: Boolean = false
+        private set
+
+    fun pause() {
+        isPaused = true
+        Log.d(TAG, "AudioEncoder PAUSED (discarding audio frames during camera transition)")
+    }
+
+    fun resume() {
+        isPaused = false
+        Log.d(TAG, "AudioEncoder RESUMED (recording active frames)")
+    }
+
     fun start(outputFile: File, sampleRate: Int, channels: Int) {
         if (isRunning) return
         isRunning = true
+        isPaused = false
         muxerStarted = false
         audioTrackIndex = -1
 
@@ -121,6 +136,11 @@ class AudioEncoder {
                     val readBytes = BypassAudioJni.readAudioData(pcmBuffer, pcmBuffer.size)
 
                     if (readBytes > 0) {
+                        if (isPaused) {
+                            // Audio is paused during camera flip transition: discard samples so ring buffer stays drained and timestamps do not drift ahead of video
+                            continue
+                        }
+
                         // Mark "audio arriving" state variable as requested
                         if (!isAudioArriving) {
                             isAudioArriving = true

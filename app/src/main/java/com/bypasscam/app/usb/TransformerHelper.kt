@@ -60,8 +60,8 @@ object TransformerHelper {
                 val videoSequence = EditedMediaItemSequence.Builder(videoItems).build()
 
                 // 2. Build composition (with audio sequence if USB audio present)
-                val composition = if (hasUsbAudio) {
-                    val audioItem = EditedMediaItem.Builder(MediaItem.fromUri(Uri.fromFile(audioFile!!))).build()
+                val composition = if (hasUsbAudio && audioFile != null) {
+                    val audioItem = EditedMediaItem.Builder(MediaItem.fromUri(Uri.fromFile(audioFile))).build()
                     val audioSequence = EditedMediaItemSequence.Builder(listOf(audioItem)).build()
                     Composition.Builder(listOf(videoSequence, audioSequence)).build()
                 } else {

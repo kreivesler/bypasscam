@@ -1,6 +1,8 @@
 package com.bypasscam.app.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -14,10 +16,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.bypasscam.app.camera.CameraManager
-import androidx.compose.ui.unit.sp
 
 @Composable
 fun CameraScreen(
@@ -28,6 +31,12 @@ fun CameraScreen(
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     var isRecording by remember { mutableStateOf(false) }
+    val isProcessingVideo by cameraManager.isProcessingVideo.collectAsState()
+
+    // Prevent closing the app accidentally while video is being processed and saved
+    BackHandler(enabled = isProcessingVideo) {
+        // App close blocked while processing
+    }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
         // Camera Preview
@@ -88,6 +97,7 @@ fun CameraScreen(
                 onClick = {
                     cameraManager.flipCamera(lifecycleOwner)
                 },
+                enabled = !isProcessingVideo,
                 colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.4f)),
                 modifier = Modifier.border(width = 2.dp, color = Color.White, shape = RoundedCornerShape(8.dp)),
                 shape = RoundedCornerShape(8.dp)
@@ -105,6 +115,7 @@ fun CameraScreen(
             ) {
                 Button(
                     onClick = { cameraManager.takePhoto() },
+                    enabled = !isProcessingVideo && !isRecording,
                     shape = CircleShape,
                     modifier = Modifier.fillMaxSize(),
                     colors = ButtonDefaults.buttonColors(containerColor = Color.White),
@@ -130,6 +141,7 @@ fun CameraScreen(
                             isRecording = recordingState
                         }
                     },
+                    enabled = !isProcessingVideo,
                     shape = if (isRecording) RoundedCornerShape(6.dp) else CircleShape,
                     modifier = Modifier.fillMaxSize(),
                     colors = ButtonDefaults.buttonColors(
@@ -137,6 +149,53 @@ fun CameraScreen(
                     ),
                     contentPadding = PaddingValues(0.dp)
                 ) {}
+            }
+        }
+
+        // Modal Overlay Alert: Blocks UI and instructs user not to close app while saving
+        if (isProcessingVideo) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.82f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = Color(0xFF1E1E1E),
+                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)),
+                    modifier = Modifier
+                        .padding(horizontal = 28.dp)
+                        .fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        CircularProgressIndicator(
+                            color = Color(0xFF00E676),
+                            strokeWidth = 3.dp,
+                            modifier = Modifier.size(48.dp)
+                        )
+                        Spacer(modifier = Modifier.height(20.dp))
+                        Text(
+                            text = "Salvando seu vídeo...",
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 18.sp,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text(
+                            text = "Por favor, não feche o aplicativo enquanto o vídeo é processado e salvo na galeria.",
+                            color = Color.White.copy(alpha = 0.85f),
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                }
             }
         }
     }
