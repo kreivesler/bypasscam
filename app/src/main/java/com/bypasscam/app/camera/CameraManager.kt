@@ -255,16 +255,14 @@ class CameraManager(private val context: Context) {
             isFlippingDuringRecording = true
             pauseTimer()
 
-            // Pause USB audio capture during camera transition so audio and video stay frame-synchronized
-            if (isUsingUsbMicDuringRecording) {
-                audioEncoder.pause()
-            }
-
+            // Keep audio recording until current segment's VideoRecordEvent.Finalize to prevent cutting video frames early
             onSegmentFinalizedForFlip = {
-                Log.d(TAG, "Segment finalized. Switching camera lens now (isFrontCamera was $isFrontCamera)...")
-                isFrontCamera = !isFrontCamera
-                startCamera(lifecycleOwner, surfaceProvider) {
-                    startNextVideoSegment()
+                Handler(Looper.getMainLooper()).post {
+                    Log.d(TAG, "Segment finalized. Switching camera lens now (isFrontCamera was $isFrontCamera)...")
+                    isFrontCamera = !isFrontCamera
+                    startCamera(lifecycleOwner, surfaceProvider) {
+                        startNextVideoSegment()
+                    }
                 }
             }
             recording?.stop()
@@ -337,10 +335,7 @@ class CameraManager(private val context: Context) {
             stopTimer()
             recording?.stop()
             recording = null
-            if (isUsingUsbMicDuringRecording) {
-                audioEncoder.stop()
-                usbHelper?.stopMicStreaming()
-            }
+            // AudioEncoder will be stopped cleanly upon VideoRecordEvent.Finalize
             onRecordingStateChanged(false)
             return
         }
@@ -378,12 +373,13 @@ class CameraManager(private val context: Context) {
             usbHelper?.startMicStreaming()
             val sampleRate = usbHelper?.audioSampleRate ?: 48000
             val micChannels = usbHelper?.audioChannels ?: channels
-            Log.i(TAG, "Starting AudioEncoder in paused state (waiting for camera ready: rate=$sampleRate, channels=$micChannels)...")
-            audioEncoder.start(audioFile, sampleRate, micChannels, startPaused = true)
+            Log.i(TAG, "Starting AudioEncoder with dynamic sampleRate=$sampleRate, micChannels=$micChannels")
+            audioEncoder.start(audioFile, sampleRate, micChannels, startPaused = false)
         } else {
             Log.d(TAG, "Iniciando sessão padrão com microfone interno...")
         }
 
+        startTimer()
         startNextVideoSegment()
     }
 
@@ -413,13 +409,14 @@ class CameraManager(private val context: Context) {
 
         Log.d(TAG, "Iniciando segmento de vídeo #$segmentIndex (${segmentFile.name})...")
 
-        recording = pendingRecording.start(ContextCompat.getMainExecutor(context)) { recordEvent ->
+        recording = pendingRecording.start(cameraExecutor) { recordEvent ->
             when (recordEvent) {
                 is VideoRecordEvent.Start -> {
                     Log.d(TAG, "Segmento #$segmentIndex iniciado com sucesso (Camera Ready)")
                     isFlippingDuringRecording = false
-                    onRecordingStateCallback?.invoke(true)
-                    // Camera is READY: Trigger audio and UI timer concurrently!
+                    Handler(Looper.getMainLooper()).post {
+                        onRecordingStateCallback?.invoke(true)
+                    }
                     if (isUsingUsbMicDuringRecording) {
                         audioEncoder.resume()
                     }
@@ -432,7 +429,10 @@ class CameraManager(private val context: Context) {
                 is VideoRecordEvent.Finalize -> {
                     Log.d(TAG, "Segmento #$segmentIndex finalizado (error: ${recordEvent.hasError()})")
                     if (isFlippingDuringRecording) {
-                        Log.d(TAG, "Segmento finalizado devido a flip de câmera. Executando transição de câmera...")
+                        Log.d(TAG, "Segmento finalizado devido a flip de câmera. Pausando áudio e executando transição de câmera...")
+                        if (isUsingUsbMicDuringRecording) {
+                            audioEncoder.pause()
+                        }
                         val action = onSegmentFinalizedForFlip
                         onSegmentFinalizedForFlip = null
                         action?.invoke()
@@ -442,7 +442,9 @@ class CameraManager(private val context: Context) {
                     if (!isSessionRecording) {
                         // User pressed STOP: finalize complete video
                         stopTimer()
-                        onRecordingStateCallback?.invoke(false)
+                        Handler(Looper.getMainLooper()).post {
+                            onRecordingStateCallback?.invoke(false)
+                        }
                         if (isUsingUsbMicDuringRecording) {
                             audioEncoder.stop()
                             usbHelper?.stopMicStreaming()
@@ -455,7 +457,9 @@ class CameraManager(private val context: Context) {
                             recording?.close()
                             recording = null
                             Log.e(TAG, "Recording error: Code ${recordEvent.error} - Details: ${recordEvent.cause?.message}")
-                            Toast.makeText(context, "Recording failed: error ${recordEvent.error}", Toast.LENGTH_SHORT).show()
+                            Handler(Looper.getMainLooper()).post {
+                                Toast.makeText(context, "Recording failed: error ${recordEvent.error}", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     }
                 }
