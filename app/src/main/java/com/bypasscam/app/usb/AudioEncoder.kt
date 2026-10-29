@@ -87,10 +87,10 @@ class AudioEncoder {
         Log.d(TAG, "AudioEncoder RESUMED (recording active frames)")
     }
 
-    fun start(outputFile: File, sampleRate: Int, channels: Int) {
+    fun start(outputFile: File, sampleRate: Int, channels: Int, startPaused: Boolean = false) {
         if (isRunning) return
         isRunning = true
-        isPaused = false
+        isPaused = startPaused
         muxerStarted = false
         audioTrackIndex = -1
 

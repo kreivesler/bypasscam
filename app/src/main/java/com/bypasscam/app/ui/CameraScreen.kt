@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.bypasscam.app.camera.CameraManager
+import java.util.Locale
 
 @Composable
 fun CameraScreen(
@@ -32,6 +33,22 @@ fun CameraScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     var isRecording by remember { mutableStateOf(false) }
     val isProcessingVideo by cameraManager.isProcessingVideo.collectAsState()
+    val isRecordingActive by cameraManager.isRecordingActive.collectAsState()
+    val isRecordingPaused by cameraManager.isRecordingPaused.collectAsState()
+    val recordingDurationSeconds by cameraManager.recordingDurationSeconds.collectAsState()
+
+    val formattedDuration = remember(recordingDurationSeconds) {
+        val minutes = recordingDurationSeconds / 60
+        val seconds = recordingDurationSeconds % 60
+        String.format(Locale.US, "%02d:%02d", minutes, seconds)
+    }
+
+    // Keep isRecording state in sync when session ends from camera manager
+    LaunchedEffect(isRecordingActive, isProcessingVideo) {
+        if (!isRecordingActive && !isProcessingVideo) {
+            isRecording = false
+        }
+    }
 
     // Prevent closing the app accidentally while video is being processed and saved
     BackHandler(enabled = isProcessingVideo) {
@@ -83,72 +100,113 @@ fun CameraScreen(
             }
         }
 
-        // Bottom Controls
-        Row(
+        // Bottom Controls Container
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(bottom = 48.dp)
+                .padding(bottom = 36.dp)
                 .align(Alignment.BottomCenter),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Switch Camera lens (Front / Rear)
-            Button(
-                onClick = {
-                    cameraManager.flipCamera(lifecycleOwner)
-                },
-                enabled = !isProcessingVideo,
-                colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.4f)),
-                modifier = Modifier.border(width = 2.dp, color = Color.White, shape = RoundedCornerShape(8.dp)),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Text("Flip", color = Color.White)
+            // Recording Timer Clock Badge (Appears above the 3 buttons once camera is ready)
+            if (isRecordingActive) {
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = Color.Black.copy(alpha = 0.70f),
+                    border = BorderStroke(
+                        1.dp,
+                        if (isRecordingPaused) Color(0xFFFFB300) else Color.Red.copy(alpha = 0.75f)
+                    ),
+                    modifier = Modifier.padding(bottom = 16.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(10.dp)
+                                .background(
+                                    color = if (isRecordingPaused) Color(0xFFFFB300) else Color.Red,
+                                    shape = CircleShape
+                                )
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = if (isRecordingPaused) "$formattedDuration (Pausado)" else formattedDuration,
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
+                        )
+                    }
+                }
             }
 
-            // Capture Photo (Clean shutter button: outer ring with inner solid circle)
-            Box(
-                modifier = Modifier
-                    .size(76.dp)
-                    .border(width = 4.dp, color = Color.White, shape = CircleShape)
-                    .padding(6.dp),
-                contentAlignment = Alignment.Center
+            // Bottom Buttons Row (Flip, Photo, Record)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Button(
-                    onClick = { cameraManager.takePhoto() },
-                    enabled = !isProcessingVideo && !isRecording,
-                    shape = CircleShape,
-                    modifier = Modifier.fillMaxSize(),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color.White),
-                    contentPadding = PaddingValues(0.dp)
-                ) {}
-            }
-
-            // Record Video (Shutter button: Red circle for record, White rounded square for stop)
-            Box(
-                modifier = Modifier
-                    .size(76.dp)
-                    .border(
-                        width = 4.dp,
-                        color = Color.White,
-                        shape = CircleShape
-                    )
-                    .padding(if (isRecording) 18.dp else 6.dp),
-                contentAlignment = Alignment.Center
-            ) {
+                // Switch Camera lens (Front / Rear)
                 Button(
                     onClick = {
-                        cameraManager.toggleRecording(isUsbMicConnected, usbChannels) { recordingState ->
-                            isRecording = recordingState
-                        }
+                        cameraManager.flipCamera(lifecycleOwner)
                     },
-                    enabled = !isProcessingVideo,
-                    shape = if (isRecording) RoundedCornerShape(6.dp) else CircleShape,
-                    modifier = Modifier.fillMaxSize(),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isRecording) Color.White else Color.Red
-                    ),
-                    contentPadding = PaddingValues(0.dp)
-                ) {}
+                    enabled = !isProcessingVideo && !isRecordingPaused,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Black.copy(alpha = 0.4f)),
+                    modifier = Modifier.border(width = 2.dp, color = Color.White, shape = RoundedCornerShape(8.dp)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("Flip", color = Color.White)
+                }
+
+                // Capture Photo (Clean shutter button: outer ring with inner solid circle)
+                Box(
+                    modifier = Modifier
+                        .size(76.dp)
+                        .border(width = 4.dp, color = Color.White, shape = CircleShape)
+                        .padding(6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Button(
+                        onClick = { cameraManager.takePhoto() },
+                        enabled = !isProcessingVideo && !isRecording && !isRecordingActive,
+                        shape = CircleShape,
+                        modifier = Modifier.fillMaxSize(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                        contentPadding = PaddingValues(0.dp)
+                    ) {}
+                }
+
+                // Record Video (Shutter button: Red circle for record, White rounded square for stop)
+                Box(
+                    modifier = Modifier
+                        .size(76.dp)
+                        .border(
+                            width = 4.dp,
+                            color = Color.White,
+                            shape = CircleShape
+                        )
+                        .padding(if (isRecording || isRecordingActive) 18.dp else 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Button(
+                        onClick = {
+                            cameraManager.toggleRecording(isUsbMicConnected, usbChannels) { recordingState ->
+                                isRecording = recordingState
+                            }
+                        },
+                        enabled = !isProcessingVideo,
+                        shape = if (isRecording || isRecordingActive) RoundedCornerShape(6.dp) else CircleShape,
+                        modifier = Modifier.fillMaxSize(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isRecording || isRecordingActive) Color.White else Color.Red
+                        ),
+                        contentPadding = PaddingValues(0.dp)
+                    ) {}
+                }
             }
         }
 

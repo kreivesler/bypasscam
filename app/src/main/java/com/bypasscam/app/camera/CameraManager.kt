@@ -3,6 +3,9 @@ package com.bypasscam.app.camera
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
 import android.view.OrientationEventListener
@@ -62,6 +65,67 @@ class CameraManager(private val context: Context) {
     // Video processing / saving state observable for UI blocking modal
     private val _isProcessingVideo = MutableStateFlow(false)
     val isProcessingVideo: StateFlow<Boolean> = _isProcessingVideo.asStateFlow()
+
+    // Recording timer state flows
+    private val _recordingDurationSeconds = MutableStateFlow(0L)
+    val recordingDurationSeconds: StateFlow<Long> = _recordingDurationSeconds.asStateFlow()
+
+    private val _isRecordingActive = MutableStateFlow(false)
+    val isRecordingActive: StateFlow<Boolean> = _isRecordingActive.asStateFlow()
+
+    private val _isRecordingPaused = MutableStateFlow(false)
+    val isRecordingPaused: StateFlow<Boolean> = _isRecordingPaused.asStateFlow()
+
+    private val timerHandler = Handler(Looper.getMainLooper())
+    private var accumulatedElapsedMs = 0L
+    private var lastResumeUptimeMs = 0L
+
+    private val timerRunnable = object : Runnable {
+        override fun run() {
+            if (_isRecordingActive.value && !_isRecordingPaused.value) {
+                val now = SystemClock.uptimeMillis()
+                val totalMs = accumulatedElapsedMs + (now - lastResumeUptimeMs)
+                _recordingDurationSeconds.value = totalMs / 1000L
+                timerHandler.postDelayed(this, 250L)
+            }
+        }
+    }
+
+    private fun startTimer() {
+        accumulatedElapsedMs = 0L
+        lastResumeUptimeMs = SystemClock.uptimeMillis()
+        _recordingDurationSeconds.value = 0L
+        _isRecordingActive.value = true
+        _isRecordingPaused.value = false
+        timerHandler.removeCallbacks(timerRunnable)
+        timerHandler.post(timerRunnable)
+    }
+
+    private fun pauseTimer() {
+        if (_isRecordingActive.value && !_isRecordingPaused.value) {
+            val now = SystemClock.uptimeMillis()
+            accumulatedElapsedMs += (now - lastResumeUptimeMs)
+            _isRecordingPaused.value = true
+            timerHandler.removeCallbacks(timerRunnable)
+        }
+    }
+
+    private fun resumeTimer() {
+        if (_isRecordingActive.value && _isRecordingPaused.value) {
+            lastResumeUptimeMs = SystemClock.uptimeMillis()
+            _isRecordingPaused.value = false
+            timerHandler.removeCallbacks(timerRunnable)
+            timerHandler.post(timerRunnable)
+        }
+    }
+
+    private fun stopTimer() {
+        _isRecordingActive.value = false
+        _isRecordingPaused.value = false
+        _recordingDurationSeconds.value = 0L
+        accumulatedElapsedMs = 0L
+        timerHandler.removeCallbacks(timerRunnable)
+    }
 
     // Orientation handling for both Portrait and Landscape
     private var orientationEventListener: OrientationEventListener? = null
@@ -189,6 +253,7 @@ class CameraManager(private val context: Context) {
         if (isSessionRecording) {
             Log.d(TAG, "Flip requested during active recording. Finalizing current segment cleanly...")
             isFlippingDuringRecording = true
+            pauseTimer()
 
             // Pause USB audio capture during camera transition so audio and video stay frame-synchronized
             if (isUsingUsbMicDuringRecording) {
@@ -269,6 +334,7 @@ class CameraManager(private val context: Context) {
             isSessionRecording = false
             isFlippingDuringRecording = false
             _isProcessingVideo.value = true
+            stopTimer()
             recording?.stop()
             recording = null
             if (isUsingUsbMicDuringRecording) {
@@ -312,8 +378,8 @@ class CameraManager(private val context: Context) {
             usbHelper?.startMicStreaming()
             val sampleRate = usbHelper?.audioSampleRate ?: 48000
             val micChannels = usbHelper?.audioChannels ?: channels
-            Log.i(TAG, "Starting AudioEncoder with dynamic sampleRate=$sampleRate, micChannels=$micChannels")
-            audioEncoder.start(audioFile, sampleRate, micChannels)
+            Log.i(TAG, "Starting AudioEncoder in paused state (waiting for camera ready: rate=$sampleRate, channels=$micChannels)...")
+            audioEncoder.start(audioFile, sampleRate, micChannels, startPaused = true)
         } else {
             Log.d(TAG, "Iniciando sessão padrão com microfone interno...")
         }
@@ -350,12 +416,17 @@ class CameraManager(private val context: Context) {
         recording = pendingRecording.start(ContextCompat.getMainExecutor(context)) { recordEvent ->
             when (recordEvent) {
                 is VideoRecordEvent.Start -> {
-                    Log.d(TAG, "Segmento #$segmentIndex iniciado com sucesso")
+                    Log.d(TAG, "Segmento #$segmentIndex iniciado com sucesso (Camera Ready)")
                     isFlippingDuringRecording = false
                     onRecordingStateCallback?.invoke(true)
-                    // Resume audio capture as soon as camera begins streaming frames
+                    // Camera is READY: Trigger audio and UI timer concurrently!
                     if (isUsingUsbMicDuringRecording) {
                         audioEncoder.resume()
+                    }
+                    if (!_isRecordingActive.value) {
+                        startTimer()
+                    } else if (_isRecordingPaused.value) {
+                        resumeTimer()
                     }
                 }
                 is VideoRecordEvent.Finalize -> {
@@ -370,6 +441,7 @@ class CameraManager(private val context: Context) {
 
                     if (!isSessionRecording) {
                         // User pressed STOP: finalize complete video
+                        stopTimer()
                         onRecordingStateCallback?.invoke(false)
                         if (isUsingUsbMicDuringRecording) {
                             audioEncoder.stop()
