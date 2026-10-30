@@ -30,6 +30,11 @@ import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
+data class CameraTake(
+    val videoFile: File,
+    val audioFile: File?
+)
+
 /**
  * Helper class that sets up CameraX components (Preview, ImageCapture, VideoCapture).
  * Optimized to balance performance and avoid frame drops on devices like Moto g04.
@@ -49,12 +54,11 @@ class CameraManager(private val context: Context) {
     // USB Bypass variables
     var usbHelper: UsbHelper? = null
     private var isUsingUsbMicDuringRecording = false
-    private val audioEncoder = AudioEncoder()
-    private val tempVideoSegments = mutableListOf<File>()
-    private val segmentGapsUs = mutableListOf<Long>()
-    private var flipRequestTimeUs: Long = 0L
-    private var isContinuousAudioRecording = false
-    private var tempAudioFile: File? = null
+    private var currentAudioEncoder: AudioEncoder? = null
+    private var lastAudioEncoder: AudioEncoder? = null
+    private val recordedTakes = mutableListOf<CameraTake>()
+    private var currentTakeVideoFile: File? = null
+    private var currentTakeAudioFile: File? = null
     private var tempMuxedFile: File? = null
     private var pendingContentValues: ContentValues? = null
     
@@ -80,6 +84,7 @@ class CameraManager(private val context: Context) {
     val isRecordingPaused: StateFlow<Boolean> = _isRecordingPaused.asStateFlow()
 
     private val timerHandler = Handler(Looper.getMainLooper())
+    private var pendingTimerStartRunnable: Runnable? = null
     private var accumulatedElapsedMs = 0L
     private var lastResumeUptimeMs = 0L
 
@@ -105,6 +110,8 @@ class CameraManager(private val context: Context) {
     }
 
     private fun pauseTimer() {
+        pendingTimerStartRunnable?.let { timerHandler.removeCallbacks(it) }
+        pendingTimerStartRunnable = null
         if (_isRecordingActive.value && !_isRecordingPaused.value) {
             val now = SystemClock.uptimeMillis()
             accumulatedElapsedMs += (now - lastResumeUptimeMs)
@@ -123,6 +130,8 @@ class CameraManager(private val context: Context) {
     }
 
     private fun stopTimer() {
+        pendingTimerStartRunnable?.let { timerHandler.removeCallbacks(it) }
+        pendingTimerStartRunnable = null
         _isRecordingActive.value = false
         _isRecordingPaused.value = false
         _recordingDurationSeconds.value = 0L
@@ -254,18 +263,19 @@ class CameraManager(private val context: Context) {
         }
 
         if (isSessionRecording) {
-            Log.d(TAG, "Flip requested during active recording. Recording transition gap timestamp...")
+            Log.d(TAG, "Flip requested during active recording. Finalizing current take cleanly...")
             isFlippingDuringRecording = true
-            flipRequestTimeUs = SystemClock.elapsedRealtimeNanos() / 1000L
             pauseTimer()
 
-            // Keep audio recording continuously during flip to capture natural audio without codec cuts
             onSegmentFinalizedForFlip = {
                 Handler(Looper.getMainLooper()).post {
-                    Log.d(TAG, "Segment finalized. Switching camera lens now (isFrontCamera was $isFrontCamera)...")
+                    Log.d(TAG, "Take finalized. Switching camera lens now (isFrontCamera was $isFrontCamera)...")
                     isFrontCamera = !isFrontCamera
                     startCamera(lifecycleOwner, surfaceProvider) {
-                        startNextVideoSegment()
+                        Log.d(TAG, "Camera preview bound. Starting next take...")
+                        if (isSessionRecording) {
+                            startNextVideoSegment()
+                        }
                     }
                 }
             }
@@ -337,9 +347,16 @@ class CameraManager(private val context: Context) {
             isFlippingDuringRecording = false
             _isProcessingVideo.value = true
             stopTimer()
-            recording?.stop()
-            recording = null
-            // AudioEncoder will be stopped cleanly upon VideoRecordEvent.Finalize
+            val activeRecording = recording
+            if (activeRecording != null) {
+                activeRecording.stop()
+                recording = null
+            } else {
+                currentAudioEncoder?.stop()
+                currentAudioEncoder = null
+                usbHelper?.stopMicStreaming()
+                finalizeAndSaveSession()
+            }
             onRecordingStateChanged(false)
             return
         }
@@ -356,20 +373,14 @@ class CameraManager(private val context: Context) {
         isSessionRecording = true
         isFlippingDuringRecording = false
         isUsingUsbMicDuringRecording = isUsbMicConnected
-        isContinuousAudioRecording = false
         pendingContentValues = contentValues
         currentChannels = channels
         onRecordingStateCallback = onRecordingStateChanged
 
-        // Clear previous video segments and measured transition gaps
-        tempVideoSegments.clear()
-        segmentGapsUs.clear()
-        flipRequestTimeUs = 0L
-
-        // Set up temp cache files
-        val audioFile = File(context.cacheDir, "temp_audio.mp4")
-        if (audioFile.exists()) audioFile.delete()
-        tempAudioFile = audioFile
+        // Clear previous takes
+        recordedTakes.clear()
+        currentAudioEncoder?.stop()
+        currentAudioEncoder = null
 
         val muxedFile = File(context.cacheDir, "temp_muxed.mp4")
         if (muxedFile.exists()) muxedFile.delete()
@@ -386,7 +397,7 @@ class CameraManager(private val context: Context) {
     }
 
     /**
-     * Starts a new video segment recording.
+     * Starts a new video segment/take recording.
      */
     @SuppressLint("MissingPermission")
     private fun startNextVideoSegment() {
@@ -397,10 +408,20 @@ class CameraManager(private val context: Context) {
             return
         }
 
-        val segmentIndex = tempVideoSegments.size
-        val segmentFile = File(context.cacheDir, "temp_video_seg_$segmentIndex.mp4")
+        val takeIndex = recordedTakes.size
+        val segmentFile = File(context.cacheDir, "temp_video_take_$takeIndex.mp4")
         if (segmentFile.exists()) segmentFile.delete()
-        tempVideoSegments.add(segmentFile)
+        currentTakeVideoFile = segmentFile
+
+        val audioFile = if (isUsingUsbMicDuringRecording) {
+            val aFile = File(context.cacheDir, "temp_audio_take_$takeIndex.mp4")
+            if (aFile.exists()) aFile.delete()
+            currentTakeAudioFile = aFile
+            aFile
+        } else {
+            currentTakeAudioFile = null
+            null
+        }
 
         val fileOutputOptions = FileOutputOptions.Builder(segmentFile).build()
         val pendingRecording = if (!isUsingUsbMicDuringRecording) {
@@ -409,38 +430,56 @@ class CameraManager(private val context: Context) {
             videoCapture.output.prepareRecording(context, fileOutputOptions)
         }
 
-        Log.d(TAG, "Iniciando segmento de vídeo #$segmentIndex (${segmentFile.name})...")
+        Log.d(TAG, "Iniciando take #$takeIndex (${segmentFile.name})...")
 
         recording = pendingRecording.start(cameraExecutor) { recordEvent ->
             when (recordEvent) {
                 is VideoRecordEvent.Start -> {
-                    Log.d(TAG, "Segmento #$segmentIndex iniciado com sucesso (Camera Ready)")
+                    Log.d(TAG, "Take #$takeIndex iniciado com sucesso (Camera Ready). Fôlego de 1s de configuração...")
                     isFlippingDuringRecording = false
                     Handler(Looper.getMainLooper()).post {
                         onRecordingStateCallback?.invoke(true)
                     }
 
-                    if (segmentIndex == 0) {
-                        // First segment: Start continuous audio capture and UI timer synchronously at camera ready
-                        if (isUsingUsbMicDuringRecording && tempAudioFile != null && !isContinuousAudioRecording) {
-                            val sampleRate = usbHelper?.audioSampleRate ?: 48000
-                            val micChannels = usbHelper?.audioChannels ?: currentChannels
-                            Log.i(TAG, "Starting continuous AudioEncoder at camera ready (rate=$sampleRate, channels=$micChannels)")
-                            audioEncoder.start(tempAudioFile!!, sampleRate, micChannels, startPaused = false)
-                            isContinuousAudioRecording = true
-                        }
-                        startTimer()
-                    } else {
-                        // Subsequent segment after a flip: calculate exact transition gap
-                        val nowUs = SystemClock.elapsedRealtimeNanos() / 1000L
-                        val gapUs = if (flipRequestTimeUs > 0L) (nowUs - flipRequestTimeUs).coerceAtLeast(0L) else 0L
-                        segmentGapsUs.add(gapUs)
-                        Log.i(TAG, "Measured flip transition GAP #${segmentGapsUs.size}: ${gapUs / 1000}ms ($gapUs us)")
-                        resumeTimer()
+                    if (isUsingUsbMicDuringRecording && audioFile != null) {
+                        val encoder = AudioEncoder()
+                        currentAudioEncoder = encoder
+                        lastAudioEncoder = encoder
+                        val sampleRate = usbHelper?.audioSampleRate ?: 48000
+                        val micChannels = usbHelper?.audioChannels ?: currentChannels
+                        Log.i(TAG, "Iniciando AudioEncoder com vácuo de 1s para take #$takeIndex (rate=$sampleRate, channels=$micChannels)")
+                        encoder.start(audioFile, sampleRate, micChannels, startPaused = false, initialSilenceMs = 1000L)
                     }
+
+                    // Fôlego de 1s para o contador de tempo antes de começar a rodar (tanto no início quanto no flip)
+                    pendingTimerStartRunnable?.let { timerHandler.removeCallbacks(it) }
+                    val timerDelayRunnable = Runnable {
+                        pendingTimerStartRunnable = null
+                        if (isSessionRecording) {
+                            if (takeIndex == 0) {
+                                startTimer()
+                            } else {
+                                resumeTimer()
+                            }
+                        }
+                    }
+                    pendingTimerStartRunnable = timerDelayRunnable
+                    timerHandler.postDelayed(timerDelayRunnable, 1000L)
                 }
                 is VideoRecordEvent.Finalize -> {
-                    Log.d(TAG, "Segmento #$segmentIndex finalizado (error: ${recordEvent.hasError()})")
+                    Log.d(TAG, "Take #$takeIndex finalizado (error: ${recordEvent.hasError()})")
+
+                    currentAudioEncoder?.stop()
+                    currentAudioEncoder = null
+
+                    if (!recordEvent.hasError() && segmentFile.exists() && segmentFile.length() > 0L) {
+                        val validAudioFile = if (isUsingUsbMicDuringRecording && audioFile != null && audioFile.exists() && audioFile.length() > 0L) {
+                            audioFile
+                        } else null
+                        recordedTakes.add(CameraTake(segmentFile, validAudioFile))
+                        Log.d(TAG, "Take #$takeIndex registrado (video=${segmentFile.length()}b, audio=${validAudioFile?.length() ?: 0}b)")
+                    }
+
                     if (isFlippingDuringRecording) {
                         Log.d(TAG, "Segmento finalizado devido a flip de câmera. Executando transição de câmera...")
                         val action = onSegmentFinalizedForFlip
@@ -456,9 +495,7 @@ class CameraManager(private val context: Context) {
                             onRecordingStateCallback?.invoke(false)
                         }
                         if (isUsingUsbMicDuringRecording) {
-                            audioEncoder.stop()
                             usbHelper?.stopMicStreaming()
-                            isContinuousAudioRecording = false
                         }
 
                         if (!recordEvent.hasError()) {
@@ -479,49 +516,77 @@ class CameraManager(private val context: Context) {
     }
 
     /**
-     * Concatenates all recorded video segments and muxes with the audio track into a single definitive video.
+     * Concatenates all recorded video takes and muxes with their audio into a single definitive video.
      */
     private fun finalizeAndSaveSession() {
         Thread {
             try {
-                val validSegments = tempVideoSegments.filter { it.exists() && it.length() > 0L }
-                val aFile = tempAudioFile
+                val validTakes = recordedTakes.filter { it.videoFile.exists() && it.videoFile.length() > 0L }
                 val mFile = tempMuxedFile
                 val cValues = pendingContentValues
 
-                if (validSegments.isNotEmpty() && cValues != null) {
+                if (validTakes.isNotEmpty() && cValues != null) {
                     val baseName = cValues.getAsString(MediaStore.MediaColumns.DISPLAY_NAME) ?: "BypassCam_${System.currentTimeMillis()}"
 
-                    // 1. Mux or merge video segments and audio into a single MP4
-                    val muxSuccess = if (mFile != null) {
-                        if (validSegments.size == 1) {
-                            if (isUsingUsbMicDuringRecording && aFile != null && aFile.exists()) {
-                                MuxerHelper.muxVideoAndAudio(validSegments, aFile, mFile)
-                            } else {
-                                // Single segment with internal mic: segment is already complete
-                                true
+                    var muxSuccess = false
+                    val intermediateFilesToClean = mutableListOf<File>()
+
+                    if (validTakes.size == 1) {
+                        val singleTake = validTakes[0]
+                        if (isUsingUsbMicDuringRecording && singleTake.audioFile != null && singleTake.audioFile.exists()) {
+                            muxSuccess = if (mFile != null) {
+                                MuxerHelper.muxVideoAndAudio(listOf(singleTake.videoFile), singleTake.audioFile, mFile)
+                            } else false
+                        } else {
+                            // Single take with internal mic: video is already complete with audio
+                            muxSuccess = true
+                        }
+                    } else {
+                        // Multi-take with flip:
+                        Log.d(TAG, "Processando ${validTakes.size} takes após flip de câmera...")
+                        val takesToMerge = mutableListOf<File>()
+
+                        if (isUsingUsbMicDuringRecording) {
+                            // Mux each take with its own audio track first (~50ms per take, zero transcoding, exact lip sync)
+                            for ((idx, take) in validTakes.withIndex()) {
+                                if (take.audioFile != null && take.audioFile.exists() && take.audioFile.length() > 0L) {
+                                    val muxedTake = File(context.cacheDir, "temp_take_${idx}_muxed.mp4")
+                                    if (muxedTake.exists()) muxedTake.delete()
+                                    val muxed = MuxerHelper.muxVideoAndAudio(listOf(take.videoFile), take.audioFile, muxedTake)
+                                    if (muxed && muxedTake.exists() && muxedTake.length() > 0L) {
+                                        takesToMerge.add(muxedTake)
+                                        intermediateFilesToClean.add(muxedTake)
+                                    } else {
+                                        takesToMerge.add(take.videoFile)
+                                    }
+                                } else {
+                                    takesToMerge.add(take.videoFile)
+                                }
                             }
                         } else {
-                            // Multi-segment with flip (front/back in portrait/landscape):
-                            // Use Media3 Transformer to normalize rotations and match audio slices
-                            Log.d(TAG, "Merging ${validSegments.size} video segments with Media3 Transformer (gaps: $segmentGapsUs)...")
+                            // Internal mic: each take already has its audio track embedded
+                            takesToMerge.addAll(validTakes.map { it.videoFile })
+                        }
+
+                        // Merge all takes with Media3 Transformer: normalizes rotations (front 270°, rear 90°)
+                        // without green screen/glitches, preserving the embedded audio track of each take
+                        muxSuccess = if (mFile != null && takesToMerge.isNotEmpty()) {
                             TransformerHelper.mergeSegmentsWithAudioSync(
                                 context = context,
-                                videoFiles = validSegments,
-                                segmentGapsUs = segmentGapsUs,
-                                audioFile = if (isUsingUsbMicDuringRecording) aFile else null,
+                                videoFiles = takesToMerge,
+                                audioFile = null, // preserves the embedded audio in each take!
                                 outputFile = mFile
                             )
-                        }
-                    } else false
+                        } else false
+                    }
 
                     val fileToSave = if (muxSuccess && mFile != null && mFile.exists() && mFile.length() > 0L) {
                         mFile
-                    } else if (validSegments.size == 1 && !isUsingUsbMicDuringRecording) {
-                        validSegments[0]
+                    } else if (validTakes.size == 1 && !isUsingUsbMicDuringRecording) {
+                        validTakes[0].videoFile
                     } else {
                         Log.w(TAG, "Muxing was not successful or produced empty file. Falling back to first video segment.")
-                        validSegments[0]
+                        validTakes[0].videoFile
                     }
 
                     var videoSavedSuccessfully = false
@@ -537,7 +602,7 @@ class CameraManager(private val context: Context) {
                                 }
                             }
                             videoSavedSuccessfully = true
-                            Log.d(TAG, "Video with ${validSegments.size} segments successfully saved to MediaStore: $finalUri")
+                            Log.d(TAG, "Video with ${validTakes.size} takes successfully saved to MediaStore: $finalUri")
                         } else {
                             Log.e(TAG, "Could not insert final video record into MediaStore.")
                         }
@@ -546,7 +611,8 @@ class CameraManager(private val context: Context) {
                     }
 
                     // 2. Save standalone audio file separately in Movies/BypassCam if USB mic was used
-                    if (isUsingUsbMicDuringRecording && aFile != null && aFile.exists()) {
+                    val primaryAudioFile = validTakes.firstOrNull { it.audioFile != null && it.audioFile.exists() }?.audioFile
+                    if (isUsingUsbMicDuringRecording && primaryAudioFile != null) {
                         try {
                             val audioValues = ContentValues().apply {
                                 put(MediaStore.MediaColumns.DISPLAY_NAME, "${baseName}_audio.mp4")
@@ -559,7 +625,7 @@ class CameraManager(private val context: Context) {
                             )
                             if (audioUri != null) {
                                 context.contentResolver.openOutputStream(audioUri)?.use { out ->
-                                    aFile.inputStream().use { input ->
+                                    primaryAudioFile.inputStream().use { input ->
                                         input.copyTo(out)
                                     }
                                 }
@@ -571,8 +637,9 @@ class CameraManager(private val context: Context) {
                     }
 
                     // 3. Audio observation report .txt generation
-                    val isAudioReceived = audioEncoder.isAudioArriving && audioEncoder.totalBytesRead > 0L
-                    if (isUsingUsbMicDuringRecording) {
+                    val activeEncoder = lastAudioEncoder
+                    val isAudioReceived = activeEncoder?.isAudioArriving == true && (activeEncoder.totalBytesRead) > 0L
+                    if (isUsingUsbMicDuringRecording && activeEncoder != null) {
                         try {
                             val audit = usbHelper?.hardwareAuditText ?: ""
                             val jniStatus = try {
@@ -580,12 +647,12 @@ class CameraManager(private val context: Context) {
                             } catch (e: Throwable) {
                                 "Error reading JNI status: ${e.message}"
                             }
-                            val logContent = audioEncoder.generateObservationReport(audit, jniStatus)
+                            val logContent = activeEncoder.generateObservationReport(audit, jniStatus)
 
                             val logValues = ContentValues().apply {
                                 put(MediaStore.MediaColumns.DISPLAY_NAME, "${baseName}_audio_log.txt")
                                 put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
-                                put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/BypassCam")
+                                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/BypassCam")
                             }
                             val logUri = context.contentResolver.insert(
                                 MediaStore.Files.getContentUri("external"),
@@ -604,12 +671,12 @@ class CameraManager(private val context: Context) {
 
                     // User notification Toast
                     ContextCompat.getMainExecutor(context).execute {
-                        val segmentsMsg = if (validSegments.size > 1) " (${validSegments.size} ângulos)" else ""
+                        val takesMsg = if (validTakes.size > 1) " (${validTakes.size} ângulos)" else ""
                         val feedbackMsg = when {
                             videoSavedSuccessfully && isAudioReceived ->
-                                "Vídeo$segmentsMsg, áudio & log salvos em Movies/BypassCam"
+                                "Vídeo$takesMsg, áudio & log salvos em Movies/BypassCam"
                             videoSavedSuccessfully ->
-                                "Vídeo$segmentsMsg salvo na galeria!"
+                                "Vídeo$takesMsg salvo na galeria!"
                             else ->
                                 "Falha ao salvar vídeo na galeria"
                         }
@@ -618,10 +685,13 @@ class CameraManager(private val context: Context) {
 
                     // Cleanup temporary files
                     if (videoSavedSuccessfully) {
-                        validSegments.forEach { it.delete() }
-                        aFile?.delete()
+                        validTakes.forEach { take ->
+                            take.videoFile.delete()
+                            take.audioFile?.delete()
+                        }
+                        intermediateFilesToClean.forEach { it.delete() }
                         mFile?.delete()
-                        tempVideoSegments.clear()
+                        recordedTakes.clear()
                         Log.d(TAG, "Temporary cache files cleaned up after successful definitive save")
                     }
                 }

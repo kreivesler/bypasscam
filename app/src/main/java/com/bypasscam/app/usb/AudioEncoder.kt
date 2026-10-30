@@ -87,7 +87,13 @@ class AudioEncoder {
         Log.d(TAG, "AudioEncoder RESUMED (recording active frames)")
     }
 
-    fun start(outputFile: File, sampleRate: Int, channels: Int, startPaused: Boolean = false) {
+    fun start(
+        outputFile: File,
+        sampleRate: Int,
+        channels: Int,
+        startPaused: Boolean = false,
+        initialSilenceMs: Long = 1000L
+    ) {
         if (isRunning) return
         isRunning = true
         isPaused = startPaused
@@ -108,7 +114,7 @@ class AudioEncoder {
         totalAudioFramesEncoded = 0L
 
         encoderThread = Thread {
-            Log.d(TAG, "AudioEncoder background thread started (sourceChannels=$channels, outChannels=2, rate=$sampleRate).")
+            Log.d(TAG, "AudioEncoder background thread started (sourceChannels=$channels, outChannels=2, rate=$sampleRate, initialSilenceMs=$initialSilenceMs).")
             try {
                 // Video containers (MP4) expect standard Stereo AAC tracks
                 val outputChannels = 2
@@ -128,6 +134,49 @@ class AudioEncoder {
                 val pcmBuffer = ByteArray(2048)
                 val stereoBuffer = ByteArray(4096)
                 var lastObservationLogTime = System.currentTimeMillis()
+
+                // 1. Injetar o vácuo de silêncio inicial (ex: 1000ms = 1s) para que áudio e vídeo tenham durações exatas
+                if (initialSilenceMs > 0L) {
+                    val totalSilentFrames = (sampleRate * initialSilenceMs) / 1000L
+                    var remainingSilentFrames = totalSilentFrames
+                    val zeroBuffer = ByteArray(4096)
+
+                    Log.i(TAG, "Injetando vácuo inicial de áudio de ${initialSilenceMs}ms ($totalSilentFrames frames)...")
+
+                    while (isRunning && remainingSilentFrames > 0L) {
+                        val codec = mediaCodec ?: break
+                        val framesThisChunk = minOf(remainingSilentFrames, 1024L).toInt()
+                        val bytesThisChunk = framesThisChunk * 4
+
+                        val inputIndex = codec.dequeueInputBuffer(10000)
+                        if (inputIndex >= 0) {
+                            val inputBuffer = codec.getInputBuffer(inputIndex)
+                            if (inputBuffer != null) {
+                                inputBuffer.clear()
+                                inputBuffer.put(zeroBuffer, 0, bytesThisChunk)
+
+                                val ptsUs = (totalAudioFramesEncoded * 1_000_000L) / sampleRate
+                                totalAudioFramesEncoded += framesThisChunk
+
+                                codec.queueInputBuffer(inputIndex, 0, bytesThisChunk, ptsUs, 0)
+                                remainingSilentFrames -= framesThisChunk
+                            }
+                        }
+                        drainEncoder(codec, bufferInfo, false)
+                    }
+                    Log.i(TAG, "Vácuo inicial injetado com sucesso ($totalAudioFramesEncoded frames codificados).")
+
+                    // Aguarda o tempo físico de fôlego decorrer enquanto a câmera estabiliza foco e luz,
+                    // descartando amostras de microfone nesse intervalo para manter o ring buffer limpo
+                    val folegoStartTime = System.currentTimeMillis()
+                    val drainBuffer = ByteArray(2048)
+                    while (isRunning && (System.currentTimeMillis() - folegoStartTime) < initialSilenceMs) {
+                        BypassAudioJni.readAudioData(drainBuffer, drainBuffer.size)
+                        Thread.sleep(15)
+                    }
+                    // Drena qualquer amostra residual
+                    while (BypassAudioJni.readAudioData(drainBuffer, drainBuffer.size) > 0) {}
+                }
 
                 while (isRunning) {
                     val codec = mediaCodec ?: break
