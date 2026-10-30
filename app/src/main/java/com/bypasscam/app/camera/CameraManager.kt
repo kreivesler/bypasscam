@@ -51,6 +51,9 @@ class CameraManager(private val context: Context) {
     private var isUsingUsbMicDuringRecording = false
     private val audioEncoder = AudioEncoder()
     private val tempVideoSegments = mutableListOf<File>()
+    private val segmentGapsUs = mutableListOf<Long>()
+    private var flipRequestTimeUs: Long = 0L
+    private var isContinuousAudioRecording = false
     private var tempAudioFile: File? = null
     private var tempMuxedFile: File? = null
     private var pendingContentValues: ContentValues? = null
@@ -251,11 +254,12 @@ class CameraManager(private val context: Context) {
         }
 
         if (isSessionRecording) {
-            Log.d(TAG, "Flip requested during active recording. Finalizing current segment cleanly...")
+            Log.d(TAG, "Flip requested during active recording. Recording transition gap timestamp...")
             isFlippingDuringRecording = true
+            flipRequestTimeUs = SystemClock.elapsedRealtimeNanos() / 1000L
             pauseTimer()
 
-            // Keep audio recording until current segment's VideoRecordEvent.Finalize to prevent cutting video frames early
+            // Keep audio recording continuously during flip to capture natural audio without codec cuts
             onSegmentFinalizedForFlip = {
                 Handler(Looper.getMainLooper()).post {
                     Log.d(TAG, "Segment finalized. Switching camera lens now (isFrontCamera was $isFrontCamera)...")
@@ -352,12 +356,15 @@ class CameraManager(private val context: Context) {
         isSessionRecording = true
         isFlippingDuringRecording = false
         isUsingUsbMicDuringRecording = isUsbMicConnected
+        isContinuousAudioRecording = false
         pendingContentValues = contentValues
         currentChannels = channels
         onRecordingStateCallback = onRecordingStateChanged
 
-        // Clear previous video segments
+        // Clear previous video segments and measured transition gaps
         tempVideoSegments.clear()
+        segmentGapsUs.clear()
+        flipRequestTimeUs = 0L
 
         // Set up temp cache files
         val audioFile = File(context.cacheDir, "temp_audio.mp4")
@@ -371,10 +378,6 @@ class CameraManager(private val context: Context) {
         if (isUsbMicConnected) {
             Log.d(TAG, "Iniciando sessão com bypass de driver USB...")
             usbHelper?.startMicStreaming()
-            val sampleRate = usbHelper?.audioSampleRate ?: 48000
-            val micChannels = usbHelper?.audioChannels ?: channels
-            Log.i(TAG, "Starting AudioEncoder in paused state (waiting for camera ready: rate=$sampleRate, channels=$micChannels)...")
-            audioEncoder.start(audioFile, sampleRate, micChannels, startPaused = true)
         } else {
             Log.d(TAG, "Iniciando sessão padrão com microfone interno...")
         }
@@ -416,22 +419,30 @@ class CameraManager(private val context: Context) {
                     Handler(Looper.getMainLooper()).post {
                         onRecordingStateCallback?.invoke(true)
                     }
-                    if (isUsingUsbMicDuringRecording) {
-                        audioEncoder.resume()
-                    }
-                    if (!_isRecordingActive.value) {
+
+                    if (segmentIndex == 0) {
+                        // First segment: Start continuous audio capture and UI timer synchronously at camera ready
+                        if (isUsingUsbMicDuringRecording && tempAudioFile != null && !isContinuousAudioRecording) {
+                            val sampleRate = usbHelper?.audioSampleRate ?: 48000
+                            val micChannels = usbHelper?.audioChannels ?: currentChannels
+                            Log.i(TAG, "Starting continuous AudioEncoder at camera ready (rate=$sampleRate, channels=$micChannels)")
+                            audioEncoder.start(tempAudioFile!!, sampleRate, micChannels, startPaused = false)
+                            isContinuousAudioRecording = true
+                        }
                         startTimer()
-                    } else if (_isRecordingPaused.value) {
+                    } else {
+                        // Subsequent segment after a flip: calculate exact transition gap
+                        val nowUs = SystemClock.elapsedRealtimeNanos() / 1000L
+                        val gapUs = if (flipRequestTimeUs > 0L) (nowUs - flipRequestTimeUs).coerceAtLeast(0L) else 0L
+                        segmentGapsUs.add(gapUs)
+                        Log.i(TAG, "Measured flip transition GAP #${segmentGapsUs.size}: ${gapUs / 1000}ms ($gapUs us)")
                         resumeTimer()
                     }
                 }
                 is VideoRecordEvent.Finalize -> {
                     Log.d(TAG, "Segmento #$segmentIndex finalizado (error: ${recordEvent.hasError()})")
                     if (isFlippingDuringRecording) {
-                        Log.d(TAG, "Segmento finalizado devido a flip de câmera. Pausando áudio e executando transição de câmera...")
-                        if (isUsingUsbMicDuringRecording) {
-                            audioEncoder.pause()
-                        }
+                        Log.d(TAG, "Segmento finalizado devido a flip de câmera. Executando transição de câmera...")
                         val action = onSegmentFinalizedForFlip
                         onSegmentFinalizedForFlip = null
                         action?.invoke()
@@ -447,6 +458,7 @@ class CameraManager(private val context: Context) {
                         if (isUsingUsbMicDuringRecording) {
                             audioEncoder.stop()
                             usbHelper?.stopMicStreaming()
+                            isContinuousAudioRecording = false
                         }
 
                         if (!recordEvent.hasError()) {
@@ -491,11 +503,12 @@ class CameraManager(private val context: Context) {
                             }
                         } else {
                             // Multi-segment with flip (front/back in portrait/landscape):
-                            // Use Media3 Transformer to normalize rotations and stitch seamlessly
-                            Log.d(TAG, "Merging ${validSegments.size} video segments with Media3 Transformer...")
+                            // Use Media3 Transformer to normalize rotations and match audio slices
+                            Log.d(TAG, "Merging ${validSegments.size} video segments with Media3 Transformer (gaps: $segmentGapsUs)...")
                             TransformerHelper.mergeSegmentsWithAudioSync(
                                 context = context,
                                 videoFiles = validSegments,
+                                segmentGapsUs = segmentGapsUs,
                                 audioFile = if (isUsingUsbMicDuringRecording) aFile else null,
                                 outputFile = mFile
                             )
