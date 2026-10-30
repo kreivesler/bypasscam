@@ -671,16 +671,12 @@ class CameraManager(private val context: Context) {
 
                     // User notification Toast
                     ContextCompat.getMainExecutor(context).execute {
-                        val takesMsg = if (validTakes.size > 1) " (${validTakes.size} ângulos)" else ""
-                        val feedbackMsg = when {
-                            videoSavedSuccessfully && isAudioReceived ->
-                                "Vídeo$takesMsg, áudio & log salvos em Movies/BypassCam"
-                            videoSavedSuccessfully ->
-                                "Vídeo$takesMsg salvo na galeria!"
-                            else ->
-                                "Falha ao salvar vídeo na galeria"
+                        val feedbackMsg = if (videoSavedSuccessfully) {
+                            "Video saved to Movies/BypassCam"
+                        } else {
+                            "Failed to save video to gallery"
                         }
-                        Toast.makeText(context, feedbackMsg, Toast.LENGTH_LONG).show()
+                        Toast.makeText(context, feedbackMsg, Toast.LENGTH_SHORT).show()
                     }
 
                     // Cleanup temporary files

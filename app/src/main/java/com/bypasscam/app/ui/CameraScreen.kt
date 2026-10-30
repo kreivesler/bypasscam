@@ -134,7 +134,7 @@ fun CameraScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = if (isRecordingPaused) "$formattedDuration (Pausado)" else formattedDuration,
+                            text = if (isRecordingPaused) "$formattedDuration (Paused)" else formattedDuration,
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
                             fontSize = 14.sp
@@ -238,7 +238,7 @@ fun CameraScreen(
                         )
                         Spacer(modifier = Modifier.height(20.dp))
                         Text(
-                            text = "Salvando seu vídeo...",
+                            text = "Saving your video...",
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
                             fontSize = 18.sp,
@@ -246,7 +246,7 @@ fun CameraScreen(
                         )
                         Spacer(modifier = Modifier.height(10.dp))
                         Text(
-                            text = "Por favor, não feche o aplicativo enquanto o vídeo é processado e salvo na galeria.",
+                            text = "Please do not close the app while the video is being processed and saved.",
                             color = Color.White.copy(alpha = 0.85f),
                             fontSize = 13.sp,
                             lineHeight = 18.sp,
